@@ -13,7 +13,6 @@ import torch.distributed as dist
 from models import SiT_models
 from download import find_model
 from transport import create_transport, Sampler
-from diffusers.models import AutoencoderKL
 from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
 from tqdm import tqdm
 import os
@@ -68,9 +67,9 @@ def main(mode, args):
         learn_sigma = False
 
     # Load model:
-    latent_size = args.image_size // 8
+    input_size = args.image_size
     model = SiT_models[args.model](
-        input_size=latent_size,
+        input_size=input_size,
         num_classes=args.num_classes,
         learn_sigma=learn_sigma,
     ).to(device)
@@ -115,7 +114,6 @@ def main(mode, args):
             last_step_size=args.last_step_size,
             num_steps=args.num_sampling_steps,
         )
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
     using_cfg = args.cfg_scale > 1.0
 
@@ -156,7 +154,7 @@ def main(mode, args):
     
     for i in pbar:
         # Sample inputs:
-        z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
+        z = torch.randn(n, model.in_channels, input_size, input_size, device=device)
         y = torch.randint(0, args.num_classes, (n,), device=device)
         
         # Setup classifier-free guidance:
@@ -174,7 +172,6 @@ def main(mode, args):
         if using_cfg:
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
-        samples = vae.decode(samples / 0.18215).sample
         samples = torch.clamp(127.5 * samples + 128.0, 0, 255).permute(0, 2, 3, 1).to("cpu", dtype=torch.uint8).numpy()
 
         # Save samples to disk as individual .png files
@@ -207,7 +204,6 @@ if __name__ == "__main__":
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
 
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--vae",  type=str, choices=["ema", "mse"], default="ema")
     parser.add_argument("--sample-dir", type=str, default="samples")
     parser.add_argument("--per-proc-batch-size", type=int, default=4)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)

@@ -8,7 +8,6 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 from torchvision.utils import save_image
-from diffusers.models import AutoencoderKL
 from download import find_model
 from models import SiT_models
 from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
@@ -34,9 +33,9 @@ def main(mode, args):
         learn_sigma = False
 
     # Load model:
-    latent_size = args.image_size // 8
+    input_size = args.image_size
     model = SiT_models[args.model](
-        input_size=latent_size,
+        input_size=input_size,
         num_classes=args.num_classes,
         learn_sigma=learn_sigma,
     ).to(device)
@@ -81,15 +80,12 @@ def main(mode, args):
             num_steps=args.num_sampling_steps,
         )
     
-
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-
     # Labels to condition the model with (feel free to change):
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
     
     # Create sampling noise:
     n = len(class_labels)
-    z = torch.randn(n, 4, latent_size, latent_size, device=device)
+    z = torch.randn(n, 4, input_size, input_size, device=device)
     y = torch.tensor(class_labels, device=device)
 
     # Setup classifier-free guidance:
@@ -102,7 +98,6 @@ def main(mode, args):
     start_time = time()
     samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    samples = vae.decode(samples / 0.18215).sample
     print(f"Sampling took {time() - start_time:.2f} seconds.")
 
     # Save and display images:
@@ -122,7 +117,6 @@ if __name__ == "__main__":
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
     
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
