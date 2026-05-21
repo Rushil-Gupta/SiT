@@ -148,8 +148,18 @@ def main(args):
     input_size = args.image_size
     model = SiT_models[args.model](
         input_size=input_size,
-        num_classes=num_classes
+        num_classes=num_classes,
+        use_guidance=True,
+        embed_dim=args.embed_dim,
     )
+
+    # Load class means into guidance module
+    if args.use_guidance:
+        class_means_path = os.path.join(args.ops_data_dir, 'ops_class_means.npy')
+        assert os.path.isfile(class_means_path), f"Class means not found: {class_means_path}"
+        class_means = np.load(class_means_path)
+        model.y_embedder.class_means.copy_(torch.from_numpy(class_means))
+        logger.info(f"Loaded class means from {class_means_path} ({class_means.shape})")
 
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -187,6 +197,8 @@ def main(args):
     train_steps = 0
     log_steps = 0
     running_loss = 0
+    running_recon_loss = 0
+    running_kl_loss = 0
     start_time = time()
 
     # Labels to condition the model with (feel free to change):
@@ -217,6 +229,23 @@ def main(args):
             model_kwargs = dict(y=y)
             loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
+
+            # Compute KL loss for guidance module
+            if args.use_guidance and args.beta > 0:
+                # Recompute guidance embeddings for KL (need mu_c, sigma_c)
+                with torch.no_grad():
+                    # We need to get mu_c and sigma_c from the guidance module
+                    # The training_losses already called model.forward which calls y_embedder
+                    # We need to recompute to get mu_c, sigma_c for KL
+                    labels = y
+                    class_mean = model.module.y_embedder.class_means[labels]
+                    mu_c = model.module.y_embedder.mu_phi(class_mean)
+                    sigma_c = torch.nn.functional.softplus(model.module.y_embedder.sigma_phi(class_mean))
+                kl_loss = model.module.y_embedder.kl_loss(mu_c, sigma_c, labels)
+                loss = loss + args.beta * kl_loss
+            else:
+                kl_loss = torch.tensor(0.0, device=device)
+
             opt.zero_grad()
             loss.backward()
             opt.step()
@@ -224,6 +253,8 @@ def main(args):
 
             # Log loss values:
             running_loss += loss.item()
+            running_recon_loss += loss_dict["loss"].mean().item()
+            running_kl_loss += kl_loss.item() if kl_loss.numel() > 0 else 0.0
             log_steps += 1
             train_steps += 1
             if train_steps % args.log_every == 0:
@@ -233,16 +264,24 @@ def main(args):
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
+                avg_recon_loss = torch.tensor(running_recon_loss / log_steps, device=device)
+                avg_kl_loss = torch.tensor(running_kl_loss / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_recon_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_kl_loss, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                avg_recon_loss = avg_recon_loss.item() / dist.get_world_size()
+                avg_kl_loss = avg_kl_loss.item() / dist.get_world_size()
+                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Recon: {avg_recon_loss:.4f}, KL: {avg_kl_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 if args.wandb:
                     wandb_utils.log(
-                        { "train loss": avg_loss, "train steps/sec": steps_per_sec },
+                        { "train loss": avg_loss, "recon loss": avg_recon_loss, "kl loss": avg_kl_loss, "train steps/sec": steps_per_sec },
                         step=train_steps
                     )
                 # Reset monitoring variables:
                 running_loss = 0
+                running_recon_loss = 0
+                running_kl_loss = 0
                 log_steps = 0
                 start_time = time()
 
@@ -301,6 +340,12 @@ if __name__ == "__main__":
     parser.add_argument("--wandb", action="store_true")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
+    parser.add_argument("--use-guidance", action="store_true", default=True,
+                        help="Use guidance embedding module (default: True)")
+    parser.add_argument("--embed-dim", type=int, default=384,
+                        help="Dimension of encoder embeddings for guidance module")
+    parser.add_argument("--beta", type=float, default=1.0,
+                        help="Weight for KL loss term")
 
     parse_transport_args(parser)
     args = parser.parse_args()

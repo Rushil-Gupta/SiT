@@ -61,6 +61,84 @@ class TimestepEmbedder(nn.Module):
         return t_emb
 
 
+class GuidanceEmbeddingModule(nn.Module):
+    """
+    Replaces LabelEmbedder. Uses precomputed class-mean encoder embeddings
+    passed through learned MLPs to produce guidance embeddings for conditioning.
+
+    Handles label dropout for classifier-free guidance by mapping dropped labels
+    to the NTC (null) class index.
+    """
+    def __init__(self, num_classes, hidden_size, dropout_prob=0.1, embed_dim=384):
+        super().__init__()
+        self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
+        self.embed_dim = embed_dim
+
+        self.register_buffer('class_means', torch.zeros(num_classes + 1, embed_dim))
+
+        self.mu_phi = nn.Sequential(
+            nn.Linear(embed_dim, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.sigma_phi = nn.Sequential(
+            nn.Linear(embed_dim, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+
+        self.mu_eta = nn.Parameter(torch.zeros(hidden_size))
+        self.Sigma_eta = nn.Parameter(torch.ones(hidden_size))
+
+    def token_drop(self, labels, force_drop_ids=None):
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        return torch.where(drop_ids, self.num_classes, labels)
+
+    def forward(self, labels, train=True, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+
+        class_mean = self.class_means[labels]
+
+        mu_c = self.mu_phi(class_mean)
+        sigma_c = torch.nn.functional.softplus(self.sigma_phi(class_mean))
+
+        null_mask = (labels == self.num_classes)
+        sigma_c = sigma_c * (~null_mask).unsqueeze(-1).float()
+
+        noise = torch.randn_like(mu_c)
+        e_c = mu_c + sigma_c * noise
+
+        return e_c
+
+    def forward_deterministic(self, labels):
+        class_mean = self.class_means[labels]
+        mu_c = self.mu_phi(class_mean)
+        return mu_c
+
+    def kl_loss(self, mu_c, sigma_c, labels):
+        non_null_mask = (labels != self.num_classes)
+        if non_null_mask.sum() == 0:
+            return torch.tensor(0.0, device=mu_c.device)
+
+        mu_nn = mu_c[non_null_mask]
+        sigma_nn = sigma_c[non_null_mask]
+        var_c = sigma_nn ** 2
+
+        kl = 0.5 * (
+            torch.sum(torch.log(self.Sigma_eta / var_c), dim=-1)
+            - mu_nn.shape[-1]
+            + torch.sum(var_c / self.Sigma_eta, dim=-1)
+            + torch.sum((mu_nn - self.mu_eta) ** 2 / self.Sigma_eta, dim=-1)
+        )
+        return kl.mean()
+
+
 class LabelEmbedder(nn.Module):
     """
     Embeds class labels into vector representations. Also handles label dropout for classifier-free guidance.
@@ -155,6 +233,8 @@ class SiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        use_guidance=True,
+        embed_dim=384,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -162,10 +242,15 @@ class SiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.use_guidance = use_guidance
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+
+        if use_guidance:
+            self.y_embedder = GuidanceEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
+        else:
+            self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
@@ -194,8 +279,14 @@ class SiT(nn.Module):
         nn.init.xavier_uniform_(w.view([w.shape[0], -1]))
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
-        # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        # Initialize label embedding table / guidance module
+        if self.use_guidance:
+            nn.init.normal_(self.y_embedder.mu_phi[0].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.mu_phi[2].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.sigma_phi[0].weight, std=0.02)
+            nn.init.normal_(self.y_embedder.sigma_phi[2].weight, std=0.02)
+        else:
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -236,7 +327,10 @@ class SiT(nn.Module):
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
+        if self.use_guidance:
+            y = self.y_embedder(y, self.training)  # (N, D) - guidance embedding
+        else:
+            y = self.y_embedder(y, self.training)  # (N, D) - class embedding
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)

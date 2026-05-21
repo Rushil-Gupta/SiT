@@ -29,8 +29,10 @@ def main(mode, args):
         assert args.num_classes == 1000
         assert args.image_size == 256, "512x512 models are not yet available for auto-download." # remove this line when 512x512 models are available
         learn_sigma = args.image_size == 256
+        use_guidance = False
     else:
         learn_sigma = False
+        use_guidance = True
 
     # Load model:
     input_size = args.image_size
@@ -38,11 +40,19 @@ def main(mode, args):
         input_size=input_size,
         num_classes=args.num_classes,
         learn_sigma=learn_sigma,
+        use_guidance=use_guidance,
+        embed_dim=args.embed_dim,
     ).to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
+
+    # Load class means into guidance module if using guidance
+    if use_guidance and args.prior_path is not None:
+        class_means = np.load(args.prior_path)
+        model.y_embedder.class_means.copy_(torch.from_numpy(class_means))
+        print(f"Loaded class means from {args.prior_path} ({class_means.shape})")
     model.eval()  # important!
     transport = create_transport(
         args.path_type,
@@ -82,7 +92,7 @@ def main(mode, args):
     
     # Labels to condition the model with (feel free to change):
     class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
-    
+
     # Create sampling noise:
     n = len(class_labels)
     z = torch.randn(n, 4, input_size, input_size, device=device)
@@ -90,7 +100,7 @@ def main(mode, args):
 
     # Setup classifier-free guidance:
     z = torch.cat([z, z], 0)
-    y_null = torch.tensor([1000] * n, device=device)
+    y_null = torch.tensor([args.num_classes] * n, device=device)  # NTC class index
     y = torch.cat([y, y_null], 0)
     model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
 
@@ -118,12 +128,16 @@ if __name__ == "__main__":
     
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
-    parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--num-classes", type=int, default=1451)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
+    parser.add_argument("--prior-path", type=str, default=None,
+                        help="Path to ops_class_means.npy for guidance module")
+    parser.add_argument("--embed-dim", type=int, default=384,
+                        help="Dimension of encoder embeddings for guidance module")
 
 
     parse_transport_args(parser)
