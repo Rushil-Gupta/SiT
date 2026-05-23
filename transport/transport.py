@@ -154,7 +154,7 @@ class Transport:
                 terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
             else:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
-                
+        # th.distributed.breakpoint()
         return terms
     
 

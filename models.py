@@ -128,15 +128,52 @@ class GuidanceEmbeddingModule(nn.Module):
 
         mu_nn = mu_c[non_null_mask]
         sigma_nn = sigma_c[non_null_mask]
-        var_c = sigma_nn ** 2
+
+        eps = 1e-6
+        var_c = sigma_nn ** 2 + eps
+        Sigma_eta_sq = self.Sigma_eta ** 2 + eps
 
         kl = 0.5 * (
-            torch.sum(torch.log(self.Sigma_eta / var_c), dim=-1)
+            torch.sum(torch.log(Sigma_eta_sq / var_c), dim=-1)
             - mu_nn.shape[-1]
-            + torch.sum(var_c / self.Sigma_eta, dim=-1)
-            + torch.sum((mu_nn - self.mu_eta) ** 2 / self.Sigma_eta, dim=-1)
+            + torch.sum(var_c / Sigma_eta_sq, dim=-1)
+            + torch.sum((mu_nn - self.mu_eta) ** 2 / Sigma_eta_sq, dim=-1)
         )
         return kl.mean()
+
+
+class DirectEmbeddingModule(nn.Module):
+    """
+    Minimal conditioning module. Directly uses precomputed class-mean encoder
+    embeddings as the conditioning vector with zero trainable parameters.
+
+    Label dropout still works: dropped labels map to NTC index, which returns
+    the NTC embedding.
+    """
+    def __init__(self, num_classes, hidden_size, dropout_prob=0.1, embed_dim=384):
+        super().__init__()
+        self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
+        self.embed_dim = embed_dim
+
+        self.register_buffer('class_means', torch.zeros(num_classes + 1, embed_dim))
+
+    def token_drop(self, labels, force_drop_ids=None):
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        return torch.where(drop_ids, self.num_classes, labels)
+
+    def forward(self, labels, train=True, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+
+        return self.class_means[labels]
+
+    def kl_loss(self, *args, **kwargs):
+        return torch.tensor(0.0)
 
 
 class LabelEmbedder(nn.Module):
@@ -234,6 +271,7 @@ class SiT(nn.Module):
         num_classes=1000,
         learn_sigma=True,
         use_guidance=True,
+        use_direct_embed=False,
         embed_dim=384,
     ):
         super().__init__()
@@ -243,11 +281,14 @@ class SiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.use_guidance = use_guidance
+        self.use_direct_embed = use_direct_embed
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
         self.t_embedder = TimestepEmbedder(hidden_size)
 
-        if use_guidance:
+        if use_direct_embed:
+            self.y_embedder = DirectEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
+        elif use_guidance:
             self.y_embedder = GuidanceEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
         else:
             self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
@@ -280,7 +321,9 @@ class SiT(nn.Module):
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table / guidance module
-        if self.use_guidance:
+        if self.use_direct_embed:
+            pass  # DirectEmbeddingModule has no trainable params
+        elif self.use_guidance:
             nn.init.normal_(self.y_embedder.mu_phi[0].weight, std=0.02)
             nn.init.normal_(self.y_embedder.mu_phi[2].weight, std=0.02)
             nn.init.normal_(self.y_embedder.sigma_phi[0].weight, std=0.02)

@@ -5,25 +5,29 @@ import json
 import os
 import numpy as np
 import torch
+import torch.nn as nn
 from torch.utils.data import Dataset
+from torchvision import transforms as T
+
+
+class Arcsinh(nn.Module):
+    def forward(self, x):
+        return torch.arcsinh(x)
 
 
 class OPSDataset(Dataset):
     """
     Lazy-loading dataset for OPS perturbation images.
 
-    Loads .npy files on-demand, applies per-channel standardization
-    using precomputed nontargeting statistics.
+    Loads .npy files on-demand, applies arcsinh + normalize transforms.
     """
 
-    def __init__(self, data_dir, transform=None):
+    def __init__(self, data_dir):
         """
         Args:
-            data_dir: Directory containing ops_dataset.npz, ops_perturbation_map.json, ops_stats.json
-            transform: Optional transform to apply after standardization
+            data_dir: Directory containing ops_dataset.npz, ops_perturbation_map.json
         """
         self.data_dir = data_dir
-        self.transform = transform
 
         # Load dataset arrays
         npz_path = os.path.join(data_dir, 'ops_dataset.npz')
@@ -37,12 +41,11 @@ class OPSDataset(Dataset):
             raw_map = json.load(f)
         self.perturbation_map = {int(k): v for k, v in raw_map.items()}
 
-        # Load stats and convert to tensors
-        stats_path = os.path.join(data_dir, 'ops_stats.json')
-        with open(stats_path, 'r') as f:
-            stats = json.load(f)
-        self.mean = torch.tensor(stats['mean'], dtype=torch.float32).view(4, 1, 1)
-        self.std = torch.tensor(stats['std'], dtype=torch.float32).view(4, 1, 1)
+        # Image transforms: arcsinh then normalize
+        self.transforms = T.Compose([
+            Arcsinh(),
+            T.Normalize(7., 7.)
+        ])
 
     def __len__(self):
         return len(self.file_paths)
@@ -54,14 +57,9 @@ class OPSDataset(Dataset):
         # Load image: (4, 100, 100), uint16
         image = np.load(path).astype(np.float32)
 
-        # Convert to tensor
+        # Convert to tensor and apply transforms
         image = torch.from_numpy(image)
-
-        # Standardize: (x - mean) / std
-        image = (image - self.mean) / self.std
-
-        if self.transform is not None:
-            image = self.transform(image)
+        image = self.transforms(image)
 
         return image, perturbation_idx
 

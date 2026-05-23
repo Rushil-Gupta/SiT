@@ -17,7 +17,7 @@ EPOCHS=1400
 LEARNING_RATE=1e-4
 
 # Loss hyperparameters
-BETA=1.0              # KL weight
+BETA=0.01              # KL weight
 CFG_SCALE=4.0         # Classifier-free guidance scale
 CLASS_DROPOUT=0.1     # Label dropout probability for CFG
 
@@ -56,4 +56,5 @@ torchrun --nnodes=1 --nproc_per_node=$NPROC_PER_NODE train.py \
     --num-workers 4 \
     --global-seed 0 \
     --embed-dim 384 \
-    --use-guidance
+    --use-guidance \
+    --wandb

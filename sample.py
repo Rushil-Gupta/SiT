@@ -30,9 +30,11 @@ def main(mode, args):
         assert args.image_size == 256, "512x512 models are not yet available for auto-download." # remove this line when 512x512 models are available
         learn_sigma = args.image_size == 256
         use_guidance = False
+        use_direct_embed = False
     else:
         learn_sigma = False
-        use_guidance = True
+        use_guidance = not args.use_direct_embed
+        use_direct_embed = args.use_direct_embed
 
     # Load model:
     input_size = args.image_size
@@ -41,6 +43,7 @@ def main(mode, args):
         num_classes=args.num_classes,
         learn_sigma=learn_sigma,
         use_guidance=use_guidance,
+        use_direct_embed=use_direct_embed,
         embed_dim=args.embed_dim,
     ).to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
@@ -48,8 +51,8 @@ def main(mode, args):
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
 
-    # Load class means into guidance module if using guidance
-    if use_guidance and args.prior_path is not None:
+    # Load class means into embedding module
+    if (use_guidance or use_direct_embed) and args.prior_path is not None:
         class_means = np.load(args.prior_path)
         model.y_embedder.class_means.copy_(torch.from_numpy(class_means))
         print(f"Loaded class means from {args.prior_path} ({class_means.shape})")
@@ -136,6 +139,8 @@ if __name__ == "__main__":
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
     parser.add_argument("--prior-path", type=str, default=None,
                         help="Path to ops_class_means.npy for guidance module")
+    parser.add_argument("--use-direct-embed", action="store_true", default=False,
+                        help="Use direct class mean embeddings as conditioning (no KL loss, no MLPs)")
     parser.add_argument("--embed-dim", type=int, default=384,
                         help="Dimension of encoder embeddings for guidance module")
 

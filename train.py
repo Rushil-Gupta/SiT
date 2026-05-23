@@ -149,12 +149,13 @@ def main(args):
     model = SiT_models[args.model](
         input_size=input_size,
         num_classes=num_classes,
-        use_guidance=True,
+        use_guidance=not args.use_direct_embed,
+        use_direct_embed=args.use_direct_embed,
         embed_dim=args.embed_dim,
     )
 
-    # Load class means into guidance module
-    if args.use_guidance:
+    # Load class means into embedding module
+    if args.use_direct_embed or args.use_guidance:
         class_means_path = os.path.join(args.ops_data_dir, 'ops_class_means.npy')
         assert os.path.isfile(class_means_path), f"Class means not found: {class_means_path}"
         class_means = np.load(class_means_path)
@@ -227,16 +228,14 @@ def main(args):
             x = x.to(device)
             y = y.to(device)
             model_kwargs = dict(y=y)
+            # dist.breakpoint()
             loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
 
             # Compute KL loss for guidance module
-            if args.use_guidance and args.beta > 0:
+            if args.use_guidance and not args.use_direct_embed and args.beta > 0:
                 # Recompute guidance embeddings for KL (need mu_c, sigma_c)
                 with torch.no_grad():
-                    # We need to get mu_c and sigma_c from the guidance module
-                    # The training_losses already called model.forward which calls y_embedder
-                    # We need to recompute to get mu_c, sigma_c for KL
                     labels = y
                     class_mean = model.module.y_embedder.class_means[labels]
                     mu_c = model.module.y_embedder.mu_phi(class_mean)
@@ -278,6 +277,7 @@ def main(args):
                         { "train loss": avg_loss, "recon loss": avg_recon_loss, "kl loss": avg_kl_loss, "train steps/sec": steps_per_sec },
                         step=train_steps
                     )
+                    dist.breakpoint()
                 # Reset monitoring variables:
                 running_loss = 0
                 running_recon_loss = 0
@@ -325,7 +325,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--ops-data-dir", type=str, required=True,
-                        help="Directory containing ops_dataset.npz, ops_perturbation_map.json, ops_stats.json")
+                        help="Directory containing ops_dataset.npz, ops_perturbation_map.json")
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--image-size", type=int, default=100)
@@ -342,6 +342,8 @@ if __name__ == "__main__":
                         help="Optional path to a custom SiT checkpoint")
     parser.add_argument("--use-guidance", action="store_true", default=True,
                         help="Use guidance embedding module (default: True)")
+    parser.add_argument("--use-direct-embed", action="store_true", default=False,
+                        help="Use direct class mean embeddings as conditioning (no KL loss, no MLPs)")
     parser.add_argument("--embed-dim", type=int, default=384,
                         help="Dimension of encoder embeddings for guidance module")
     parser.add_argument("--beta", type=float, default=1.0,
