@@ -11,11 +11,11 @@ import torch.nn as nn
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
+import torch.distributed as dist
 
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
-
 
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
@@ -60,7 +60,6 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-
 class GuidanceEmbeddingModule(nn.Module):
     """
     Replaces LabelEmbedder. Uses precomputed class-mean encoder embeddings
@@ -79,17 +78,18 @@ class GuidanceEmbeddingModule(nn.Module):
 
         self.mu_phi = nn.Sequential(
             nn.Linear(embed_dim, hidden_size, bias=True),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.sigma_phi = nn.Sequential(
             nn.Linear(embed_dim, hidden_size, bias=True),
-            nn.SiLU(),
+            nn.ReLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
+            nn.ReLU(),  # Ensure sigma is positive
         )
 
-        self.mu_eta = nn.Parameter(torch.zeros(hidden_size))
-        self.Sigma_eta = nn.Parameter(torch.ones(hidden_size))
+        self.register_buffer('mu_eta', torch.zeros(hidden_size))
+        self.register_buffer('sigma_sq_eta', torch.ones(hidden_size))
 
     def token_drop(self, labels, force_drop_ids=None):
         if force_drop_ids is None:
@@ -106,7 +106,8 @@ class GuidanceEmbeddingModule(nn.Module):
         class_mean = self.class_means[labels]
 
         mu_c = self.mu_phi(class_mean)
-        sigma_c = torch.nn.functional.softplus(self.sigma_phi(class_mean))
+        # sigma_c = torch.nn.functional.softplus(self.sigma_phi(class_mean))
+        sigma_c = self.sigma_phi(class_mean)
 
         null_mask = (labels == self.num_classes)
         sigma_c = sigma_c * (~null_mask).unsqueeze(-1).float()
@@ -121,6 +122,18 @@ class GuidanceEmbeddingModule(nn.Module):
         mu_c = self.mu_phi(class_mean)
         return mu_c
 
+    @torch.no_grad()
+    def update_empirical_bayes(self):
+        all_means = self.class_means[:-1]
+        mu_all = self.mu_phi(all_means)
+        # sigma_all = torch.nn.functional.softplus(self.sigma_phi(all_means))
+        sigma_all = self.sigma_phi(all_means)
+
+        self.mu_eta.copy_(mu_all.mean(dim=0))
+        diff = mu_all - self.mu_eta
+        self.sigma_sq_eta.copy_((diff ** 2 + sigma_all ** 2).mean(dim=0))
+        # dist.breakpoint()
+
     def kl_loss(self, mu_c, sigma_c, labels):
         non_null_mask = (labels != self.num_classes)
         if non_null_mask.sum() == 0:
@@ -131,13 +144,12 @@ class GuidanceEmbeddingModule(nn.Module):
 
         eps = 1e-6
         var_c = sigma_nn ** 2 + eps
-        Sigma_eta_sq = self.Sigma_eta ** 2 + eps
 
         kl = 0.5 * (
-            torch.sum(torch.log(Sigma_eta_sq / var_c), dim=-1)
+            torch.sum(torch.log((self.sigma_sq_eta + eps) / var_c), dim=-1)
             - mu_nn.shape[-1]
-            + torch.sum(var_c / Sigma_eta_sq, dim=-1)
-            + torch.sum((mu_nn - self.mu_eta) ** 2 / Sigma_eta_sq, dim=-1)
+            + torch.sum(var_c / (self.sigma_sq_eta + eps), dim=-1)
+            + torch.sum((mu_nn - self.mu_eta) ** 2 / (self.sigma_sq_eta + eps), dim=-1)
         )
         return kl.mean()
 
@@ -221,7 +233,7 @@ class SiTBlock(nn.Module):
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0) #fc1 -> act -> fc2
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, 6 * hidden_size, bias=True)
@@ -229,10 +241,9 @@ class SiTBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa)) #Modulate does x + x*scale + shift
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
-
 
 class FinalLayer(nn.Module):
     """
@@ -253,7 +264,6 @@ class FinalLayer(nn.Module):
         x = self.linear(x)
         return x
 
-
 class SiT(nn.Module):
     """
     Diffusion model with a Transformer backbone.
@@ -269,7 +279,7 @@ class SiT(nn.Module):
         mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
-        learn_sigma=True,
+        learn_sigma=False,
         use_guidance=True,
         use_direct_embed=False,
         embed_dim=384,
@@ -282,15 +292,16 @@ class SiT(nn.Module):
         self.num_heads = num_heads
         self.use_guidance = use_guidance
         self.use_direct_embed = use_direct_embed
+        self.num_classes = num_classes
 
-        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True)
-        self.t_embedder = TimestepEmbedder(hidden_size)
+        self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True) #MLP Projection layer to embed image patches
+        self.t_embedder = TimestepEmbedder(hidden_size) #Sin/Cos positional embedding for timesteps
 
-        if use_direct_embed:
+        if use_direct_embed: #Use direct class means
             self.y_embedder = DirectEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
-        elif use_guidance:
+        elif use_guidance: #Use learned guidance module with reparameterization and KL loss
             self.y_embedder = GuidanceEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
-        else:
+        else: #Use learnable embedding table for class labels
             self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
@@ -299,7 +310,7 @@ class SiT(nn.Module):
         self.blocks = nn.ModuleList([
             SiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels) #Output shape is 16. 2 x 2 x 4
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -323,7 +334,8 @@ class SiT(nn.Module):
         # Initialize label embedding table / guidance module
         if self.use_direct_embed:
             pass  # DirectEmbeddingModule has no trainable params
-        elif self.use_guidance:
+        elif self.use_guidance: 
+            ## MIGHT NEED TO CHANGE THIS INITIALIZATION TO KAIMING NORMAL OR XAVIER UNIFORM --- IGNORE FOR NOW
             nn.init.normal_(self.y_embedder.mu_phi[0].weight, std=0.02)
             nn.init.normal_(self.y_embedder.mu_phi[2].weight, std=0.02)
             nn.init.normal_(self.y_embedder.sigma_phi[0].weight, std=0.02)
@@ -361,7 +373,7 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y):
+    def forward(self, x, t, y, beta):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -370,6 +382,16 @@ class SiT(nn.Module):
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
+
+        # Save unique labels for KL before potential dropout inside y_embedder
+        # KL is only applied on unique labels to have equal weight for all KL terms
+        needs_kl = self.use_guidance and not self.use_direct_embed and self.training
+        if needs_kl:
+            kl_labels = torch.unique(y)
+            kl_labels = kl_labels[kl_labels != self.num_classes]
+        else:
+            kl_labels = None
+
         if self.use_guidance:
             y = self.y_embedder(y, self.training)  # (N, D) - guidance embedding
         else:
@@ -381,6 +403,15 @@ class SiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
             x, _ = x.chunk(2, dim=1)
+
+        # Compute KL on unique classes (within DDP graph)
+        self._kl_loss = None
+        if kl_labels is not None and len(kl_labels) > 0 and beta > 0:
+            class_mean = self.y_embedder.class_means[kl_labels]
+            mu_c = self.y_embedder.mu_phi(class_mean)
+            sigma_c = torch.nn.functional.softplus(self.y_embedder.sigma_phi(class_mean))
+            self._kl_loss = self.y_embedder.kl_loss(mu_c, sigma_c, kl_labels)
+
         return x
 
     def forward_with_cfg(self, x, t, y, cfg_scale):

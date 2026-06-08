@@ -1,7 +1,7 @@
 import torch as th
 import numpy as np
 import logging
-
+import math
 import enum
 
 from . import path
@@ -81,9 +81,10 @@ class Transport:
         eval=False,
         last_step_size=0.0,
     ):
+        # Define the end points of the time
         t0 = 0
         t1 = 1
-        eps = train_eps if not eval else sample_eps
+        eps = train_eps if not eval else sample_eps # default both are 0
         if (type(self.path_sampler) in [path.VPCPlan]):
 
             t1 = 1 - eps if (not sde or last_step_size == 0) else 1 - last_step_size
@@ -106,9 +107,9 @@ class Transport:
             x1 - data point; [batch, *dim]
         """
         
-        x0 = th.randn_like(x1)
-        t0, t1 = self.check_interval(self.train_eps, self.sample_eps)
-        t = th.rand((x1.shape[0],)) * (t1 - t0) + t0
+        x0 = th.randn_like(x1) #Sample noise from the standard normal distribution as the initial point of the path
+        t0, t1 = self.check_interval(self.train_eps, self.sample_eps) #Train and sample eps both are 0, t0 = 0, t1 = 1
+        t = th.rand((x1.shape[0],)) * (t1 - t0) + t0 #Sample t uniformly from [t0, t1] for each data point in the batch
         t = t.to(x1)
         return t, x0, x1
     
@@ -122,22 +123,23 @@ class Transport:
         """Loss for training the score model
         Args:
         - model: backbone model; could be score, noise, or velocity
-        - x1: datapoint
-        - model_kwargs: additional arguments for the model
+        - x1: datapoint, sampled from the data distribution
+        - model_kwargs: additional arguments for the model (y labels for the data points)
         """
         if model_kwargs == None:
             model_kwargs = {}
         
-        t, x0, x1 = self.sample(x1)
-        t, xt, ut = self.path_sampler.plan(t, x0, x1)
-        model_output = model(xt, t, **model_kwargs)
+        #x1 is the shape (N,C,H,W)
+        t, x0, x1 = self.sample(x1) # Samples the time, and the noise for the given datapoints
+        t, xt, ut = self.path_sampler.plan(t, x0, x1) #xt is the sample at time t in the forward process; ut is the vector field at time t along the path
+        model_output = model(xt, t, **model_kwargs) #Model output is the velocity
         B, *_, C = xt.shape
         assert model_output.size() == (B, *xt.size()[1:-1], C)
 
         terms = {}
         terms['pred'] = model_output
         if self.model_type == ModelType.VELOCITY:
-            terms['loss'] = mean_flat(((model_output - ut) ** 2))
+            terms['loss'] = mean_flat(((model_output - ut) ** 2)) #Mean over all non-batch dimensions
         else: 
             _, drift_var = self.path_sampler.compute_drift(xt, t)
             sigma_t, _ = self.path_sampler.compute_sigma_t(path.expand_t_like_x(t, xt))
@@ -155,9 +157,12 @@ class Transport:
             else:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
         # th.distributed.breakpoint()
+        # if np.any(np.isnan(terms['loss'].clone().detach().cpu().numpy())):
+            # log_state(xt=xt, t=t, model_output=model_output, ut=ut, drift_var=drift_var, sigma_t=sigma_t)
+            # th.distributed.breakpoint()
+            # raise ValueError("Loss is NaN")
         return terms
     
-
     def get_drift(
         self
     ):
@@ -192,7 +197,6 @@ class Transport:
 
         return body_fn
     
-
     def get_score(
         self,
     ):
@@ -222,8 +226,8 @@ class Sampler:
         """
         
         self.transport = transport
-        self.drift = self.transport.get_drift()
-        self.score = self.transport.get_score()
+        self.drift = self.transport.get_drift() #Get the function for calculating the drift, i.e. velocity!
+        self.score = self.transport.get_score() #Function to compute score from the velocity prediction
     
     def __get_sde_diffusion_and_drift(
         self,

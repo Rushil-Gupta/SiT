@@ -22,12 +22,11 @@ def test_kl_stability():
 
     optimizer = torch.optim.AdamW(
         list(guidance.mu_phi.parameters()) +
-        list(guidance.sigma_phi.parameters()) +
-        [guidance.mu_eta, guidance.Sigma_eta],
+        list(guidance.sigma_phi.parameters()),
         lr=1e-4,
     )
 
-    print(f"\nInitial Sigma_eta: min={guidance.Sigma_eta.min().item():.4f}, max={guidance.Sigma_eta.max().item():.4f}, mean={guidance.Sigma_eta.mean().item():.4f}")
+    print(f"\nInitial sigma_sq_eta: min={guidance.sigma_sq_eta.min().item():.4f}, max={guidance.sigma_sq_eta.max().item():.4f}, mean={guidance.sigma_sq_eta.mean().item():.4f}")
 
     kl_history = []
     sigma_eta_history = []
@@ -51,20 +50,23 @@ def test_kl_stability():
             break
 
         kl_history.append(kl.item())
-        sigma_eta_history.append(guidance.Sigma_eta.mean().item())
+        sigma_eta_history.append(guidance.sigma_sq_eta.mean().item())
 
         optimizer.zero_grad()
         kl.backward()
         optimizer.step()
 
+        if step > 0 and step % 10 == 0:
+            guidance.update_empirical_bayes()
+
         if (step + 1) % 1000 == 0:
-            print(f"  Step {step+1:5d}: KL={kl.item():.4f}, Sigma_eta mean={guidance.Sigma_eta.mean().item():.6f}")
+            print(f"  Step {step+1:5d}: KL={kl.item():.4f}, sigma_sq_eta mean={guidance.sigma_sq_eta.mean().item():.6f}")
 
     print(f"\n--- Results ---")
     print(f"Steps completed: {len(kl_history)}")
     print(f"KL range: [{min(kl_history):.4f}, {max(kl_history):.4f}]")
-    print(f"Final Sigma_eta: min={guidance.Sigma_eta.min().item():.6f}, max={guidance.Sigma_eta.max().item():.6f}, mean={guidance.Sigma_eta.mean().item():.6f}")
-    print(f"Sigma_eta² range: [{(guidance.Sigma_eta**2).min().item():.6f}, {(guidance.Sigma_eta**2).max().item():.6f}]")
+    print(f"Final sigma_sq_eta: min={guidance.sigma_sq_eta.min().item():.6f}, max={guidance.sigma_sq_eta.max().item():.6f}, mean={guidance.sigma_sq_eta.mean().item():.6f}")
+    print(f"sigma_sq_eta range: [{guidance.sigma_sq_eta.min().item():.6f}, {guidance.sigma_sq_eta.max().item():.6f}]")
 
     if len(kl_history) == num_steps:
         print("\n*** SUCCESS: KL loss remained stable for all steps ***")
