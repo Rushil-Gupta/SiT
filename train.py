@@ -271,8 +271,8 @@ def main(args):
     model = DDP(model.to(device), device_ids=[device]) #Copy of model on each GPU
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
-    
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)    
+
     # Best checkpoint tracking (defined early so checkpoint resume can reference them)
     best_val_loss = float("inf")
     best_step = 0
@@ -286,15 +286,15 @@ def main(args):
     running_kl_loss = 0
 
     if args.ckpt is not None:
+        match = re.search(r'(\d+)\.pt$', args.ckpt)
+        train_steps = int(match.group(1)) if match else 0
         ckpt_path = args.ckpt
         state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict["model"])
+        model.module.load_state_dict(state_dict["model"])
         ema.load_state_dict(state_dict["ema"])
         opt.load_state_dict(state_dict["opt"])
         args = state_dict["args"]
 
-        match = re.search(r'\d+', args.ckpt)
-        train_steps = int(match.group()) if match else 0
         # Restore best tracking if resuming from a checkpoint that has it
         if "best_val_loss" in state_dict:
             best_val_loss = state_dict["best_val_loss"]
