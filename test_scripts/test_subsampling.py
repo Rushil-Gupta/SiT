@@ -16,7 +16,7 @@ import numpy as np
 
 
 def test_default(data_dir):
-    from ops_dataset import OPSDataset
+    from dataset import OPSDataset
     ds = OPSDataset(data_dir)
     assert ds.get_num_perturbations() == 1451, f"Expected 1451, got {ds.get_num_perturbations()}"
     assert len(ds.selected_original_indices) == 1451
@@ -24,7 +24,7 @@ def test_default(data_dir):
 
 
 def test_subset(data_dir):
-    from ops_dataset import OPSDataset
+    from dataset import OPSDataset
     ds = OPSDataset(data_dir, max_perturbations=10, seed=42)
     assert ds.get_num_perturbations() == 10, f"Expected 10, got {ds.get_num_perturbations()}"
     assert len(ds.selected_original_indices) == 10
@@ -41,7 +41,7 @@ def test_subset(data_dir):
 
 
 def test_imbalance(data_dir):
-    from ops_dataset import OPSDataset
+    from dataset import OPSDataset
     ds = OPSDataset(data_dir, imbalance_factor=0.3, seed=42)
     assert ds.get_num_perturbations() == 1451
 
@@ -64,7 +64,7 @@ def test_imbalance(data_dir):
 
 
 def test_both(data_dir):
-    from ops_dataset import OPSDataset
+    from dataset import OPSDataset
     ds = OPSDataset(data_dir, max_perturbations=20, imbalance_factor=0.3, seed=42)
     assert ds.get_num_perturbations() == 20
     unique = set(ds.perturbation_indices)
@@ -77,7 +77,7 @@ def test_both(data_dir):
 
 
 def test_class_means_slice(data_dir):
-    from ops_dataset import OPSDataset
+    from dataset import OPSDataset
     ds = OPSDataset(data_dir, max_perturbations=15, seed=7)
     selected = ds.selected_original_indices
 

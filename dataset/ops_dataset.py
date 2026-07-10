@@ -17,8 +17,6 @@ class Arcsinh(nn.Module):
         # return torch.arcsinh(x)
         if x.dim() != 4:
             x = x.unsqueeze(0)  # Add batch dimension if missing
-        # ch_min = x.view(x.shape[1], -1).min(dim=-1)[0]  #  (C)
-        # ch_max = x.view(x.shape[1], -1).max(dim=-1)[0]  #  (C)
         ch_range = self._ch_max - self._ch_min
 
         x = (x - self._ch_min[None, :, None, None]) / ch_range[None, :, None, None]  # Scale to [0, 1]

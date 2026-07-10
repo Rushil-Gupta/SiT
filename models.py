@@ -60,7 +60,7 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
 
-class GuidanceEmbeddingModule(nn.Module):
+class SampleEmbeddingModule(nn.Module):
     """
     Replaces LabelEmbedder. Uses precomputed class-mean encoder embeddings
     passed through learned MLPs to produce guidance embeddings for conditioning.
@@ -153,7 +153,6 @@ class GuidanceEmbeddingModule(nn.Module):
         )
         return kl.mean()
 
-
 class DirectEmbeddingModule(nn.Module):
     """
     Minimal conditioning module. Directly uses precomputed class-mean encoder
@@ -186,6 +185,37 @@ class DirectEmbeddingModule(nn.Module):
 
     def kl_loss(self, *args, **kwargs):
         return torch.tensor(0.0)
+
+class FrozenEmbeddingModule(nn.Module):
+    """
+    Frozen precomputed embeddings with a learned projection to hidden_size.
+    Supports label dropout for classifier-free guidance.
+
+    Buffer layout:
+      [0 .. num_classes-1]  — perturbation embeddings (precomputed, frozen)
+      [num_classes]         — control cell embedding (precomputed, frozen)
+      [num_classes + 1]     — CFG null embedding (fixed zeros)
+    """
+    def __init__(self, num_classes, hidden_size, cond_dim=384, dropout_prob=0.0):
+        super().__init__()
+        self.cond_dim = cond_dim
+        self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
+        self.register_buffer('embeddings', torch.zeros(num_classes + 2, cond_dim))
+        self.proj = nn.Linear(cond_dim, hidden_size, bias=True)
+
+    def token_drop(self, labels, force_drop_ids=None):
+        if force_drop_ids is None:
+            drop_ids = torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+        else:
+            drop_ids = force_drop_ids == 1
+        return torch.where(drop_ids, self.num_classes + 1, labels)
+
+    def forward(self, labels, train=True, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        return self.proj(self.embeddings[labels])
 
 
 class LabelEmbedder(nn.Module):
@@ -280,9 +310,11 @@ class SiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=False,
-        use_guidance=True,
+        use_sample_embed=False,
         use_direct_embed=False,
         embed_dim=384,
+        use_frozen_embed=False,
+        cond_dim=384,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -290,17 +322,21 @@ class SiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
-        self.use_guidance = use_guidance
+        self.use_sample_embed = use_sample_embed
         self.use_direct_embed = use_direct_embed
+        self.use_frozen_embed = use_frozen_embed
+        self.cond_dim = cond_dim
         self.num_classes = num_classes
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size, bias=True) #MLP Projection layer to embed image patches
         self.t_embedder = TimestepEmbedder(hidden_size) #Sin/Cos positional embedding for timesteps
 
-        if use_direct_embed: #Use direct class means
+        if use_frozen_embed:
+            self.y_embedder = FrozenEmbeddingModule(num_classes, hidden_size, cond_dim, dropout_prob=class_dropout_prob)
+        elif use_direct_embed: #Use direct class means
             self.y_embedder = DirectEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
-        elif use_guidance: #Use learned guidance module with reparameterization and KL loss
-            self.y_embedder = GuidanceEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
+        elif use_sample_embed: #Use learned guidance module with reparameterization and KL loss
+            self.y_embedder = SampleEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
         else: #Use learnable embedding table for class labels
             self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
@@ -332,9 +368,12 @@ class SiT(nn.Module):
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table / guidance module
-        if self.use_direct_embed:
+        if self.use_frozen_embed:
+            nn.init.xavier_uniform_(self.y_embedder.proj.weight)
+            nn.init.constant_(self.y_embedder.proj.bias, 0)
+        elif self.use_direct_embed:
             pass  # DirectEmbeddingModule has no trainable params
-        elif self.use_guidance: 
+        elif self.use_sample_embed: 
             ## MIGHT NEED TO CHANGE THIS INITIALIZATION TO KAIMING NORMAL OR XAVIER UNIFORM --- IGNORE FOR NOW
             nn.init.normal_(self.y_embedder.mu_phi[0].weight, std=0.02)
             nn.init.normal_(self.y_embedder.mu_phi[2].weight, std=0.02)
@@ -373,7 +412,7 @@ class SiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def forward(self, x, t, y, beta):
+    def forward(self, x, t, y):
         """
         Forward pass of SiT.
         x: (N, C, H, W) tensor of spatial inputs (images or latent representations of images)
@@ -382,20 +421,7 @@ class SiT(nn.Module):
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-
-        # Save unique labels for KL before potential dropout inside y_embedder
-        # KL is only applied on unique labels to have equal weight for all KL terms
-        needs_kl = self.use_guidance and not self.use_direct_embed and self.training
-        if needs_kl:
-            kl_labels = torch.unique(y)
-            kl_labels = kl_labels[kl_labels != self.num_classes]
-        else:
-            kl_labels = None
-
-        if self.use_guidance:
-            y = self.y_embedder(y, self.training)  # (N, D) - guidance embedding
-        else:
-            y = self.y_embedder(y, self.training)  # (N, D) - class embedding
+        y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
             x = block(x, c)                      # (N, T, D)
@@ -403,16 +429,13 @@ class SiT(nn.Module):
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         if self.learn_sigma:
             x, _ = x.chunk(2, dim=1)
-
-        # Compute KL on unique classes (within DDP graph)
-        self._kl_loss = None
-        if kl_labels is not None and len(kl_labels) > 0 and beta > 0:
-            class_mean = self.y_embedder.class_means[kl_labels]
-            mu_c = self.y_embedder.mu_phi(class_mean)
-            sigma_c = torch.nn.functional.softplus(self.y_embedder.sigma_phi(class_mean))
-            self._kl_loss = self.y_embedder.kl_loss(mu_c, sigma_c, kl_labels)
-
         return x
+
+    @property
+    def null_idx(self):
+        if self.use_frozen_embed:
+            return self.num_classes + 1
+        return self.num_classes
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         """

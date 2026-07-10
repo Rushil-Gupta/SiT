@@ -7,6 +7,7 @@ Sample new images from a pre-trained SiT.
 import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+import numpy as np
 from torchvision.utils import save_image
 from download import find_model
 from models import SiT_models
@@ -31,10 +32,12 @@ def main(mode, args):
         learn_sigma = args.image_size == 256
         use_guidance = False
         use_direct_embed = False
+        use_frozen_embed = False
     else:
         learn_sigma = False
-        use_guidance = not args.use_direct_embed
+        use_guidance = not args.use_direct_embed and not args.use_frozen_embed
         use_direct_embed = args.use_direct_embed
+        use_frozen_embed = args.use_frozen_embed
 
     # Load model:
     input_size = args.image_size
@@ -44,18 +47,33 @@ def main(mode, args):
         learn_sigma=learn_sigma,
         use_guidance=use_guidance,
         use_direct_embed=use_direct_embed,
+        use_frozen_embed=use_frozen_embed,
         embed_dim=args.embed_dim,
+        cond_dim=args.cond_dim,
     ).to(device)
+
+    if torch.cuda.is_available():
+        model = torch.compile(model)
+
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
 
     # Load class means into embedding module
-    if (use_guidance or use_direct_embed) and args.prior_path is not None:
+    if args.prior_path is not None:
         class_means = np.load(args.prior_path)
-        model.y_embedder.class_means.copy_(torch.from_numpy(class_means))
-        print(f"Loaded class means from {args.prior_path} ({class_means.shape})")
+        if use_frozen_embed:
+            # Buffer: [0..K-1]=pert, [K]=control, [K+1]=CFG null (zeros)
+            K = args.num_classes
+            embeddings = np.zeros((K + 2, args.cond_dim), dtype=np.float32)
+            embeddings[:K] = class_means[:-1]
+            embeddings[K] = class_means[-1]  # control
+            model.y_embedder.embeddings.copy_(torch.from_numpy(embeddings))
+            print(f"Loaded class means ({K} pert + control) into FrozenEmbeddingModule")
+        elif use_guidance or use_direct_embed:
+            model.y_embedder.class_means.copy_(torch.from_numpy(class_means))
+            print(f"Loaded class means from {args.prior_path} ({class_means.shape})")
     model.eval()  # important!
     transport = create_transport(
         args.path_type,
@@ -103,13 +121,15 @@ def main(mode, args):
 
     # Setup classifier-free guidance:
     z = torch.cat([z, z], 0)
-    y_null = torch.tensor([args.num_classes] * n, device=device)  # NTC class index
+    null_idx = model.null_idx
+    y_null = torch.tensor([null_idx] * n, device=device)
     y = torch.cat([y, y_null], 0)
     model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
 
     # Sample images:
     start_time = time()
-    samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
+    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
     print(f"Sampling took {time() - start_time:.2f} seconds.")
 
@@ -141,6 +161,10 @@ if __name__ == "__main__":
                         help="Path to ops_class_means.npy for guidance module")
     parser.add_argument("--use-direct-embed", action="store_true", default=False,
                         help="Use direct class mean embeddings as conditioning (no KL loss, no MLPs)")
+    parser.add_argument("--use-frozen-embed", action="store_true", default=False,
+                        help="Use FrozenEmbeddingModule (precomputed embeddings + projection, no KL)")
+    parser.add_argument("--cond-dim", type=int, default=384,
+                        help="Dimension of frozen precomputed embeddings")
     parser.add_argument("--embed-dim", type=int, default=384,
                         help="Dimension of encoder embeddings for guidance module")
 

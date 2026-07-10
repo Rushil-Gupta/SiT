@@ -72,7 +72,10 @@ def main(mode, args):
         input_size=input_size,
         num_classes=args.num_classes,
         learn_sigma=learn_sigma,
+        use_frozen_embed=args.use_frozen_embed,
+        cond_dim=args.cond_dim,
     ).to(device)
+    model = torch.compile(model)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
     ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
     state_dict = find_model(ckpt_path)
@@ -160,7 +163,8 @@ def main(mode, args):
         # Setup classifier-free guidance:
         if using_cfg:
             z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * n, device=device)
+            null_idx = model.null_idx
+            y_null = torch.tensor([null_idx] * n, device=device)
             y = torch.cat([y, y_null], 0)
             model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
             model_fn = model.forward_with_cfg
@@ -168,7 +172,8 @@ def main(mode, args):
             model_kwargs = dict(y=y)
             model_fn = model.forward
 
-        samples = sample_fn(z, model_fn, **model_kwargs)[-1]
+        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            samples = sample_fn(z, model_fn, **model_kwargs)[-1]
         if using_cfg:
             samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
 
@@ -216,6 +221,10 @@ if __name__ == "__main__":
                         help="By default, use TF32 matmuls. This massively accelerates sampling on Ampere GPUs.")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a SiT checkpoint (default: auto-download a pre-trained SiT-XL/2 model).")
+    parser.add_argument("--use-frozen-embed", action="store_true", default=False,
+                        help="Use FrozenEmbeddingModule (precomputed embeddings + projection, no KL)")
+    parser.add_argument("--cond-dim", type=int, default=384,
+                        help="Dimension of frozen precomputed embeddings")
 
     parse_transport_args(parser)
     if mode == "ODE":
