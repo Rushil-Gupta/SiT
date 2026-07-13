@@ -43,6 +43,13 @@ def read_args():
                         help="Number of perturbations to randomly select (from 1451). Default: all.")
     parser.add_argument("--imbalance-factor", type=float, default=1.0,
                         help="If < 1.0, drop (1-F) samples from one randomly chosen class.")
+    parser.add_argument("--embedding-suffix", type=str, default="",
+                        help="Suffix for ops_class_means/ops_embeddings filenames (e.g. _minmax)")
+    parser.add_argument("--feature-extractor", type=str, default="mae_minmax",
+                        choices=["mae_minmax", "mae_arcsinh", "cell_dino", "dinov2", "inception", "all"],
+                        help="Feature extractor for evaluation metrics")
+    parser.add_argument("--eval-samples-per-class", type=int, default=500,
+                        help="Number of generated samples per class for metrics")
 
     parse_transport_args(parser)
     args = parser.parse_args()

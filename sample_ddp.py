@@ -225,6 +225,8 @@ if __name__ == "__main__":
                         help="Use FrozenEmbeddingModule (precomputed embeddings + projection, no KL)")
     parser.add_argument("--cond-dim", type=int, default=384,
                         help="Dimension of frozen precomputed embeddings")
+    parser.add_argument("--embedding-suffix", type=str, default="",
+                        help="Suffix for embedding filenames (e.g. _minmax)")
 
     parse_transport_args(parser)
     if mode == "ODE":

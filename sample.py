@@ -167,6 +167,8 @@ if __name__ == "__main__":
                         help="Dimension of frozen precomputed embeddings")
     parser.add_argument("--embed-dim", type=int, default=384,
                         help="Dimension of encoder embeddings for guidance module")
+    parser.add_argument("--embedding-suffix", type=str, default="",
+                        help="Suffix for ops_class_means filename (e.g. _minmax)")
 
 
     parse_transport_args(parser)

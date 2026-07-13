@@ -36,10 +36,18 @@ class Arcsinh(nn.Module):
         return torch.arcsinh(x)
 
 
+class MinMaxNormalize(nn.Module):
+    _ch_max = torch.Tensor([65535.0, 16628.0, 65212.0, 65535.0])
+    _ch_min = torch.Tensor([0.0, 0.0, 0.0, 0.0])
+    def forward(self, x):
+        ch_range = self._ch_max[:, None, None] - self._ch_min[:, None, None]
+        return (x - self._ch_min[:, None, None]) / ch_range
+
+
 class OPSImageDataset(Dataset):
     """Dataset that loads raw OPS images for encoder inference."""
 
-    def __init__(self, data_dir, indices=None):
+    def __init__(self, data_dir, indices=None, preprocessing="arcsinh"):
         npz_path = os.path.join(data_dir, 'ops_dataset.npz')
         data = np.load(npz_path, allow_pickle=True)
         self.all_file_paths = data['file_paths']
@@ -52,12 +60,20 @@ class OPSImageDataset(Dataset):
             self.file_paths = self.all_file_paths
             self.perturbation_indices = self.all_perturbation_indices
 
-        # Image transforms: resize for encoder, arcsinh, then normalize
-        self.transforms = T.Compose([
-            T.Resize((256, 256)),
-            Arcsinh(),
-            T.Normalize(7., 7.)
-        ])
+        # Image transforms: resize for encoder, then preprocessing
+        if preprocessing == "arcsinh":
+            self.transforms = T.Compose([
+                T.Resize((256, 256)),
+                Arcsinh(),
+                T.Normalize(7., 7.)
+            ])
+        elif preprocessing == "minmax":
+            self.transforms = T.Compose([
+                T.Resize((256, 256)),
+                MinMaxNormalize(),
+            ])
+        else:
+            raise ValueError(f"Unknown preprocessing: {preprocessing}")
 
     def __len__(self):
         return len(self.file_paths)
@@ -134,17 +150,25 @@ def run_inference_on_partition(model, dataset, batch_size, device, output_path):
     return n_samples
 
 
-def compute_ntc_partial(ntc_paths, batch_size, device, model_name):
+def compute_ntc_partial(ntc_paths, batch_size, device, model_name, preprocessing="arcsinh"):
     """Compute partial NTC embedding sum and count."""
     embed_dim = 384
     sum_embedding = np.zeros(embed_dim, dtype=np.float64)
     count = 0
 
-    transforms = T.Compose([
-        T.Resize((256, 256)),
-        Arcsinh(),
-        T.Normalize(7., 7.)
-    ])
+    if preprocessing == "arcsinh":
+        transforms = T.Compose([
+            T.Resize((256, 256)),
+            Arcsinh(),
+            T.Normalize(7., 7.)
+        ])
+    elif preprocessing == "minmax":
+        transforms = T.Compose([
+            T.Resize((256, 256)),
+            MinMaxNormalize(),
+        ])
+    else:
+        raise ValueError(f"Unknown preprocessing: {preprocessing}")
 
     model = load_encoder(model_name, device)
 
@@ -190,13 +214,14 @@ def worker_fn(rank, args, results):
     print(f"[{device}] Processing indices {start:,} to {end:,} ({end - start:,} samples)")
 
     # Create partitioned dataset
-    dataset = OPSImageDataset(data_dir, indices=indices)
+    dataset = OPSImageDataset(data_dir, indices=indices, preprocessing=args.preprocessing)
 
     # Load encoder
     model = load_encoder(args.model_name, device)
 
     # Run inference
-    output_path = os.path.join(data_dir, f'ops_embeddings_gpu{rank}.npy')
+    suffix = f"_{args.preprocessing}" if args.preprocessing != "arcsinh" else ""
+    output_path = os.path.join(data_dir, f'ops_embeddings{suffix}_gpu{rank}.npy')
     n_samples = run_inference_on_partition(model, dataset, args.batch_size, device, output_path)
 
     del model
@@ -211,7 +236,8 @@ def worker_fn(rank, args, results):
 
     print(f"[{device}] Computing NTC embedding for {len(ntc_partition):,} images...")
     ntc_sum, ntc_count = compute_ntc_partial(
-        ntc_partition, args.batch_size, device, args.model_name
+        ntc_partition, args.batch_size, device, args.model_name,
+        preprocessing=args.preprocessing
     )
 
     # Store results
@@ -270,7 +296,8 @@ def run_multi_gpu_inference(args):
         os.remove(r['output_path'])
 
     # Save combined embeddings
-    emb_path = os.path.join(data_dir, 'ops_embeddings.npy')
+    suffix = f"_{args.preprocessing}" if args.preprocessing != "arcsinh" else ""
+    emb_path = os.path.join(data_dir, f'ops_embeddings{suffix}.npy')
     np.save(emb_path, all_embeddings)
     print(f"Saved combined embeddings: {emb_path} ({all_embeddings.shape})")
 
@@ -285,9 +312,10 @@ def run_single_gpu_inference(args):
     """Run inference on a single GPU."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
     data_dir = args.data_dir
+    suffix = f"_{args.preprocessing}" if args.preprocessing != "arcsinh" else ""
 
     # Load dataset
-    dataset = OPSImageDataset(data_dir)
+    dataset = OPSImageDataset(data_dir, preprocessing=args.preprocessing)
 
     # Load encoder
     model = load_encoder(args.model_name, device)
@@ -320,17 +348,23 @@ def run_single_gpu_inference(args):
     torch.cuda.empty_cache()
 
     # Save embeddings
-    emb_path = os.path.join(data_dir, 'ops_embeddings.npy')
+    emb_path = os.path.join(data_dir, f'ops_embeddings{suffix}.npy')
     np.save(emb_path, all_embeddings)
     print(f"Saved embeddings: {emb_path} ({all_embeddings.shape})")
 
     # Compute NTC embedding
     ntc_paths = get_ntc_paths(data_dir)
-    ntc_transforms = T.Compose([
-        T.Resize((256, 256)),
-        Arcsinh(),
-        T.Normalize(7., 7.)
-    ])
+    if args.preprocessing == "arcsinh":
+        ntc_transforms = T.Compose([
+            T.Resize((256, 256)),
+            Arcsinh(),
+            T.Normalize(7., 7.)
+        ])
+    elif args.preprocessing == "minmax":
+        ntc_transforms = T.Compose([
+            T.Resize((256, 256)),
+            MinMaxNormalize(),
+        ])
 
     print(f"Computing NTC embedding from {len(ntc_paths):,} images...")
     ntc_sum = np.zeros(embed_dim, dtype=np.float64)
@@ -385,6 +419,7 @@ def compute_class_means(all_embeddings, labels, num_classes, ntc_embedding):
 
 def main(args):
     data_dir = args.data_dir
+    suffix = f"_{args.preprocessing}" if args.preprocessing != "arcsinh" else ""
 
     # Determine number of GPUs
     num_available = torch.cuda.device_count()
@@ -407,7 +442,7 @@ def main(args):
     class_means = compute_class_means(all_embeddings, labels, num_classes, ntc_embedding)
 
     # Save class means
-    means_path = os.path.join(data_dir, 'ops_class_means.npy')
+    means_path = os.path.join(data_dir, f'ops_class_means{suffix}.npy')
     np.save(means_path, class_means)
     print(f"Saved class means: {means_path} ({class_means.shape})")
 
@@ -419,8 +454,9 @@ def main(args):
         'total_samples': int(len(all_embeddings)),
         'ntc_samples': int(len(get_ntc_paths(data_dir))),
         'num_gpus_used': num_gpus,
+        'preprocessing': args.preprocessing,
     }
-    meta_path = os.path.join(data_dir, 'ops_encoder_meta.json')
+    meta_path = os.path.join(data_dir, f'ops_encoder_meta{suffix}.json')
     with open(meta_path, 'w') as f:
         json.dump(meta, f, indent=2)
     print(f"Saved metadata: {meta_path}")
@@ -438,5 +474,8 @@ if __name__ == '__main__':
                         help='Batch size per GPU for encoder inference')
     parser.add_argument('--num-gpus', type=str, default='all',
                         help='Number of GPUs to use (default: all, or specify an integer)')
+    parser.add_argument('--preprocessing', type=str, default='arcsinh',
+                        choices=['arcsinh', 'minmax'],
+                        help='Preprocessing to apply before encoder (default: arcsinh)')
     args = parser.parse_args()
     main(args)

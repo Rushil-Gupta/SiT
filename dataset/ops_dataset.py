@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms as T
 
 
-class Arcsinh(nn.Module):
+class GlobalMinMaxNorm(nn.Module):
     _ch_max = torch.Tensor([65535.0, 16628.0, 65212.0, 65535.0])  # Pre-computed per-channel max values from compute_data_range.py
     _ch_min = torch.Tensor([0.0, 0.0, 0.0, 0.0])  # Pre-computed per-channel min values from compute_data_range.py
     def forward(self, x):
@@ -73,9 +73,11 @@ class OPSDataset(Dataset):
             self.selected_original_indices = list(range(total_perturbations))
 
         # --- Imbalance: drop samples from one random class ---
+        self.imbalanced_class_idx = None
         if imbalance_factor < 1.0:
             num_selected = len(self.selected_original_indices)
             imbalanced_class = rng.randint(num_selected)
+            self.imbalanced_class_idx = imbalanced_class
 
             # Find indices of this class in the filtered list
             class_mask = perturbation_indices == imbalanced_class
@@ -94,7 +96,7 @@ class OPSDataset(Dataset):
 
         # Image transforms: arcsinh then normalize
         self.transforms = T.Compose([
-            Arcsinh(),
+            GlobalMinMaxNorm(),
         ])
 
     def __len__(self):

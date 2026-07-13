@@ -32,6 +32,7 @@ from dataset import OPSDataset
 import wandb_utils
 from PIL import Image
 from torchvision.utils import make_grid
+from metrics.evaluate import evaluate_model
 
 
 #################################################################################
@@ -176,14 +177,12 @@ def main(args):
     )
 
     logger.info(f"Dataset contains {len(dataset):,} images ({train_size} train, {val_size} val) across {num_classes} perturbations")
-    if rank == 0:
-        logger.info(f"Perturbation map (first 10): {dict(list(perturbation_map.items())[:10])}")
 
     # Create model:
     input_size = args.image_size #4 x 100 x 100 for the image data
 
     """
-    We use SiT-S-2 with depth = 12, heads = 6 and patch size 2
+    We use one of the pre-defined SiT models
     """
     model = SiT_models[args.model](
         input_size=input_size,
@@ -201,7 +200,7 @@ def main(args):
     # Class means obtained offline by encoding all images of a given perturbation using frozen encoder
     # and averaging the resulting embeddings. See generate_embeddings.py for details.
     if not isinstance(model.y_embedder, LabelEmbedder): #Only load class means if we are using a class mean embedding module
-        class_means_path = os.path.join(data_dir, 'ops_class_means.npy')
+        class_means_path = os.path.join(data_dir, f'ops_class_means{args.embedding_suffix}.npy')
         assert os.path.isfile(class_means_path), f"Class means not found: {class_means_path}"
         full_means = np.load(class_means_path)  # (K+1, D): K pert + control
         selected = dataset.selected_original_indices
@@ -401,7 +400,36 @@ def main(args):
                 logging.info("Generating EMA samples done.")
 
     model.eval()  # important! This disables randomized embedding dropout
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
+
+    # End-of-training evaluation
+    if rank == 0:
+        logger.info("Training complete. Running final evaluation...")
+        extractors = ["mae_minmax", "cell_dino", "dinov2", "inception"] \
+            if args.feature_extractor == "all" else [args.feature_extractor]
+        imbalanced_class_idx = getattr(dataset, 'imbalanced_class_idx', None)
+        try:
+            results = evaluate_model(
+                ema=ema,
+                transport_sampler=transport_sampler,
+                dataset=dataset,
+                data_dir=data_dir,
+                num_classes=num_classes,
+                null_idx=model.module.null_idx,
+                device=device,
+                experiment_dir=args.experiment_dir,
+                feature_extractors=extractors,
+                samples_per_class=args.eval_samples_per_class,
+                cfg_scale=args.cfg_scale,
+                embedding_suffix=args.embedding_suffix,
+                imbalanced_class_idx=imbalanced_class_idx,
+                image_size=input_size,
+            )
+            logger.info(f"Evaluation results: {json.dumps(results, indent=2)}")
+            if args.wandb:
+                wandb_utils.log(results, step=train_steps)
+        except Exception as e:
+            logger.error(f"Evaluation failed: {e}", exc_info=True)
+    dist.barrier()
 
     logger.info("Done!")
     cleanup()
