@@ -38,7 +38,7 @@ def _encode_partition(extractor_name, file_paths, batch_size, device, output_pat
     from dataset.ops_dataset import GlobalMinMaxNorm
 
     extractor = get_extractor(extractor_name, device=device)
-    normalize = GlobalMinMaxNorm()
+    # normalize = GlobalMinMaxNorm()
 
     n_samples = len(file_paths)
     embed_dim = extractor.dim
@@ -52,11 +52,11 @@ def _encode_partition(extractor_name, file_paths, batch_size, device, output_pat
         for path in batch_paths:
             image = np.load(path).astype(np.float32)
             image = torch.from_numpy(image)
-            image = normalize(image)  # GlobalMinMaxNorm → [0, 1]
+            # image = normalize(image)  # GlobalMinMaxNorm → [0, 1]
             batch.append(image)
         batch_tensor = torch.stack(batch).to(device)
-        # encode() calls _preprocess() internally (resize, to_rgb, ImageNet norm, etc.)
-        feats = extractor.encode(batch_tensor)
+        # encode() calls _preprocess() internally 
+        feats = extractor.encode(batch_tensor, gen=False)
 
         all_embeddings[idx : idx + len(batch)] = feats.cpu().numpy()
         idx += len(batch)
@@ -192,8 +192,8 @@ def main(args):
         print(f"Saved combined embeddings: {emb_path} ({all_embeddings.shape})")
 
     # Save metadata
-    npz_path = os.path.join(data_dir, "ops_dataset.npz")
-    data = np.load(npz_path, allow_pickle=True)
+    # npz_path = os.path.join(data_dir, "ops_dataset.npz")
+    # data = np.load(npz_path, allow_pickle=True)
     meta = {
         "extractor": extractor_name,
         "embed_dim": int(all_embeddings.shape[1]),
@@ -218,7 +218,7 @@ if __name__ == "__main__":
                         help="Extractor name (e.g. mae_minmax, cell_dino, dinov2, inception)")
     parser.add_argument("--batch-size", type=int, default=128,
                         help="Batch size for encoding")
-    parser.add_argument("--num-gpus", type=str, default="1",
+    parser.add_argument("--num-gpus", type=str, default="all",
                         help="Number of GPUs (default: 1, or 'all')")
     parser.add_argument("--force", action="store_true",
                         help="Recompute even if embeddings already exist")

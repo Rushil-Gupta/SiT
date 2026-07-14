@@ -21,8 +21,8 @@ class FeatureExtractor(ABC):
     def _preprocess(self, images):
         pass
 
-    def encode(self, images):
-        images = self._preprocess(images)
+    def encode(self, images, gen=False):
+        images = self._preprocess(images, gen=gen)
         with torch.no_grad():
             features = self._forward(images)
         return features

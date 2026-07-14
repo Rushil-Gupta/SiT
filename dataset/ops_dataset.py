@@ -16,11 +16,14 @@ class GlobalMinMaxNorm(nn.Module):
     def forward(self, x):
         # return torch.arcsinh(x)
         if x.dim() != 4:
+            n_dims = x.dim()
             x = x.unsqueeze(0)  # Add batch dimension if missing
         ch_range = self._ch_max - self._ch_min
 
         x = (x - self._ch_min[None, :, None, None]) / ch_range[None, :, None, None]  # Scale to [0, 1]
-        return x.squeeze(0)  # Remove batch dimension if it was added
+        if n_dims !=4:
+            x = x.squeeze(0)  # Remove batch dimension if it was added
+        return x
 
 
 class OPSDataset(Dataset):

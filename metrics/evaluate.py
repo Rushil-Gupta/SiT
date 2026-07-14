@@ -46,7 +46,7 @@ def evaluate_model(
     ode_steps=50,
 ):
     if feature_extractors is None:
-        feature_extractors = ["mae_minmax"]
+        feature_extractors = ["openphenom"]
     if isinstance(feature_extractors, str):
         feature_extractors = [feature_extractors]
 
@@ -85,7 +85,7 @@ def evaluate_model(
         gen_features_list = []
         for i in range(0, len(gen_images), 64):
             batch = gen_images[i:i+64].to(device)
-            feats = extractor.encode(batch)
+            feats = extractor.encode(batch, gen=True)
             gen_features_list.append(feats.cpu())
         gen_features_all = torch.cat(gen_features_list, dim=0)
 
