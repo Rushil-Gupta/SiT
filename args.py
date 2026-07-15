@@ -19,6 +19,7 @@ def read_args():
     parser.add_argument("--image-size", type=int, default=100)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=100)

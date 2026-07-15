@@ -8,6 +8,8 @@ import torch
 # the first flag below was False when we tested this script but True makes A100 training a lot faster:
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+# import torch._functorch.config as functorch_config
+# functorch_config.backward_pass_autocast="off"
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, random_split
@@ -38,6 +40,17 @@ from metrics.evaluate import evaluate_model
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+
+@torch.no_grad()
+def grad_norm(parameters):
+    """
+    L2 norm of gradients across a set of parameters, for logging (does not clip).
+    """
+    norms = [p.grad.norm() for p in parameters if p.grad is not None]
+    if not norms:
+        return torch.tensor(0.0)
+    return torch.norm(torch.stack(norms))
+
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -200,30 +213,38 @@ def main(args):
     # Class means obtained offline by encoding all images of a given perturbation using frozen encoder
     # and averaging the resulting embeddings. See generate_embeddings.py for details.
     if not isinstance(model.y_embedder, LabelEmbedder): #Only load class means if we are using a class mean embedding module
-        class_means_path = os.path.join(data_dir, f'ops_class_means{args.embedding_suffix}.npy')
+        class_means_path = os.path.join(data_dir, f'ops_class_means_{args.cond_embedder}.npy')
         assert os.path.isfile(class_means_path), f"Class means not found: {class_means_path}"
         full_means = np.load(class_means_path)  # (K+1, D): K pert + control
+        full_means = full_means/(np.linalg.norm(full_means, axis=1, keepdims=True)+1e-8) #Normalize to unit length
         selected = dataset.selected_original_indices
         if args.use_frozen_embed:
             # Buffer: [0..K-1]=pert, [K]=control, [K+1]=CFG null (zeros)
-            embeddings = np.zeros((num_classes + 2, args.cond_dim), dtype=np.float32)
+            embeddings = np.zeros((num_classes + 2, full_means.shape[1]), dtype=np.float32)
             embeddings[:num_classes] = full_means[selected]
-            embeddings[num_classes] = full_means[-1]  # control (was old null)
+            if args.cond_embedder != "genept":
+                embeddings[num_classes] = full_means[-1]  # control (was old null)
+            else: #GenePT does not have a non-targeting class embedding
+                embeddings[num_classes] += 1 
             model.y_embedder.embeddings.copy_(torch.from_numpy(embeddings))
             logger.info(f"Loaded class means ({len(selected)} pert + control) into FrozenEmbeddingModule")
-        else:
-            # Slice to selected perturbations + control (old null)
-            class_means = np.concatenate([full_means[selected], full_means[-1:]], axis=0)
-            model.y_embedder.class_means.copy_(torch.from_numpy(class_means))
-            logger.info(f"Loaded class means ({len(selected)} pert + null) from {class_means_path}")
+        # else:
+        #     # Slice to selected perturbations + control (old null)
+        #     class_means = np.concatenate([full_means[selected], full_means[-1:]], axis=0)
+        #     model.y_embedder.class_means.copy_(torch.from_numpy(class_means))
+        #     logger.info(f"Loaded class means ({len(selected)} pert + null) from {class_means_path}")
 
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
     model = DDP(model.to(device), device_ids=[device]) #Copy of model on each GPU
     model = torch.compile(model)
-
+    # scaler = torch.amp.GradScaler()
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)    
+    opt = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=0)
+    warmup_steps = 1000
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        opt, lr_lambda=lambda step: min(1.0, (step + 1) / warmup_steps)
+    )
 
     # Best checkpoint tracking (defined early so checkpoint resume can reference them)
     best_val_loss = float("inf")
@@ -235,6 +256,8 @@ def main(args):
     log_steps = 0
     running_loss = 0
     running_recon_loss = 0
+    running_total_grad_norm = 0
+    running_y_embedder_grad_norm = 0
 
     if args.ckpt is not None:
         match = re.search(r'(\d+)\.pt$', args.ckpt)
@@ -244,6 +267,8 @@ def main(args):
         model.module.load_state_dict(state_dict["model"])
         ema.load_state_dict(state_dict["ema"])
         opt.load_state_dict(state_dict["opt"])
+        if "scheduler" in state_dict:
+            scheduler.load_state_dict(state_dict["scheduler"])
         args = state_dict["args"]
 
         # Restore best tracking if resuming from a checkpoint that has it
@@ -311,12 +336,17 @@ def main(args):
 
             opt.zero_grad()
             loss.backward()
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            y_embedder_grad_norm = grad_norm(model.module.y_embedder.parameters())
             opt.step()
+            scheduler.step()
             update_ema(ema, model.module)
 
             # Log loss values:
             running_loss += loss.item()
             running_recon_loss += loss_dict["loss"].mean().item()
+            running_total_grad_norm += total_grad_norm.item()
+            running_y_embedder_grad_norm += y_embedder_grad_norm.item()
             log_steps += 1
             train_steps += 1
 
@@ -328,19 +358,37 @@ def main(args):
                 # Reduce loss history over all processes:
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 avg_recon_loss = torch.tensor(running_recon_loss / log_steps, device=device)
+                avg_total_grad_norm = torch.tensor(running_total_grad_norm / log_steps, device=device)
+                avg_y_embedder_grad_norm = torch.tensor(running_y_embedder_grad_norm / log_steps, device=device)
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(avg_recon_loss, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_total_grad_norm, op=dist.ReduceOp.SUM)
+                dist.all_reduce(avg_y_embedder_grad_norm, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 avg_recon_loss = avg_recon_loss.item() / dist.get_world_size()
-                logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Recon: {avg_recon_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
+                avg_total_grad_norm = avg_total_grad_norm.item() / dist.get_world_size()
+                avg_y_embedder_grad_norm = avg_y_embedder_grad_norm.item() / dist.get_world_size()
+                logger.info(
+                    f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Recon: {avg_recon_loss:.4f}, "
+                    f"Train Steps/Sec: {steps_per_sec:.2f}, Grad Norm: {avg_total_grad_norm:.4f}, "
+                    f"Y-Embedder Grad Norm: {avg_y_embedder_grad_norm:.4f}"
+                )
                 if args.wandb:
                     wandb_utils.log(
-                        { "train loss": avg_loss, "recon loss": avg_recon_loss, "train steps/sec": steps_per_sec },
+                        {
+                            "train loss": avg_loss,
+                            "recon loss": avg_recon_loss,
+                            "train steps/sec": steps_per_sec,
+                            "grad norm": avg_total_grad_norm,
+                            "y_embedder grad norm": avg_y_embedder_grad_norm,
+                        },
                         step=train_steps
                     )
                 # Reset monitoring variables:
                 running_loss = 0
                 running_recon_loss = 0
+                running_total_grad_norm = 0
+                running_y_embedder_grad_norm = 0
                 log_steps = 0
                 start_time = time()
 
@@ -351,6 +399,7 @@ def main(args):
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
+                        "scheduler": scheduler.state_dict(),
                         "args": args
                     }
                     checkpoint_path = f"{args.checkpoint_dir}/{train_steps:07d}.pt"
@@ -372,6 +421,7 @@ def main(args):
                             "model": model.module.state_dict(),
                             "ema": ema.state_dict(),
                             "opt": opt.state_dict(),
+                            "scheduler": scheduler.state_dict(),
                             "args": args,
                             "best_val_loss": best_val_loss,
                             "best_step": best_step,
@@ -402,7 +452,7 @@ def main(args):
     model.eval()  # important! This disables randomized embedding dropout
 
     # End-of-training evaluation
-    if rank == 0:
+    if rank == 0 and False:
         logger.info("Training complete. Running final evaluation...")
         extractors = ["mae_minmax", "cell_dino", "dinov2", "inception"] \
             if args.feature_extractor == "all" else [args.feature_extractor]

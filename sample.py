@@ -128,8 +128,8 @@ def main(mode, args):
 
     # Sample images:
     start_time = time()
-    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-        samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
+    # with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+    samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
     print(f"Sampling took {time() - start_time:.2f} seconds.")
 
