@@ -1,5 +1,5 @@
 import torch
-import torchvision.transforms as T
+from torchvision.transforms import v2
 import torchvision.models as models
 from ..base import FeatureExtractor
 from ..registry import register
@@ -20,14 +20,14 @@ class InceptionExtractor(FeatureExtractor):
 
     def _preprocess(self, images, gen=False):
         if gen:
-            transforms_pipeline = T.v2.Compose([
-                T.v2.Resize((299, 299)),
+            transforms_pipeline = v2.Compose([
+                v2.Resize((299, 299)),
                 ImageClamper(minv=0.0, maxv=1.0),
                 ConvtoRGB(in_channels=images.shape[1], out_channels=3),
             ])
         else:
-            transforms_pipeline = T.v2.Compose([
-                T.v2.Resize((299, 299)),
+            transforms_pipeline = v2.Compose([
+                v2.Resize((299, 299)),
                 GlobalMinMaxNorm(),
                 ConvtoRGB(in_channels=images.shape[1], out_channels=3),
             ])

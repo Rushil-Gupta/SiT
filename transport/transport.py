@@ -156,11 +156,7 @@ class Transport:
                 terms['loss'] = mean_flat(weight * ((model_output - x0) ** 2))
             else:
                 terms['loss'] = mean_flat(weight * ((model_output * sigma_t + x0) ** 2))
-        # th.distributed.breakpoint()
-        # if np.any(np.isnan(terms['loss'].clone().detach().cpu().numpy())):
-            # log_state(xt=xt, t=t, model_output=model_output, ut=ut, drift_var=drift_var, sigma_t=sigma_t)
-            # th.distributed.breakpoint()
-            # raise ValueError("Loss is NaN")
+        
         return terms
     
     def get_drift(

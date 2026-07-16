@@ -7,7 +7,7 @@ Usage:
     python eval_fid.py --ckpt path/to/checkpoint.pt --model SiT-XL/2 \
         --data-path ./dataset --dataset funk --image-size 100 \
         --embedding-suffix _minmax \
-        --feature-extractor mae_minmax \
+        --feature-extractor openphenom \
         --samples-per-class 50 --out-dir ./eval_results
 
     # Re-evaluate saved samples with different extractor
@@ -70,7 +70,6 @@ def main(args):
             input_size=args.image_size,
             num_classes=num_classes,
             use_frozen_embed=args.use_frozen_embed,
-            embed_dim=args.embed_dim,
             cond_dim=args.cond_dim,
             in_channels=4,
         ).to(device)
@@ -106,11 +105,11 @@ def main(args):
         model_fn = ema.forward_with_cfg if args.cfg_scale > 1.0 else ema.forward
 
         print(f"Generating {args.samples_per_class} samples per class...")
-        gen_images, gen_labels = [], []
         from metrics.generation import generate_balanced_samples
         gen_images, gen_labels = generate_balanced_samples(
             model_fn, transport_sampler, num_classes, null_idx,
             args.samples_per_class, args.cfg_scale, device, args.image_size,
+            ode_method=args.sampling_method,
         )
         print(f"Generated {len(gen_images)} total images")
 
@@ -125,11 +124,13 @@ def main(args):
         print(f"\nComputing metrics with: {ext_name}")
         extractor = get_extractor(ext_name, device=device)
 
-        # Extract features from generated images
+        # Extract features from generated images (gen=True: these are model
+        # samples in [0,1] output space, not raw real-dataset intensities —
+        # must go through the same preprocessing branch evaluate.py uses)
         gen_feats = []
         for i in range(0, len(gen_images), 64):
             batch = gen_images[i:i+64].to(device)
-            feats = extractor.encode(batch)
+            feats = extractor.encode(batch, gen=True)
             gen_feats.append(feats.cpu())
         gen_feats = torch.cat(gen_feats, dim=0)
 
@@ -137,7 +138,7 @@ def main(args):
         real_stats = precompute_real_stats(
             extractor, data_dir, num_classes,
             embedding_suffix=args.embedding_suffix,
-            samples_per_class=4500,
+            samples_per_class=args.real_samples_per_class,
             cache_dir=data_dir,
             selected_original_indices=selected_indices_for_stats,
         )
@@ -179,10 +180,8 @@ def main(args):
         if real_stats.get("global_feats") is not None:
             precision, recall = compute_precision_recall(real_stats["global_feats"],
                                                            feats_np)
-        else:
-            precision, recall = None, None
-            # Precision/recall needs actual features, not just mu/sigma
-            # Skip if we don't have full real features cached
+            all_results[f"{ext_name}/precision"] = precision
+            all_results[f"{ext_name}/recall"] = recall
         print(f"  {ext_name}/fid/balanced = {balanced_fid:.4f}")
 
     # Save results
@@ -206,13 +205,14 @@ if __name__ == "__main__":
                         help="Root dataset directory")
     parser.add_argument("--dataset", type=str, default="funk")
     parser.add_argument("--embedding-suffix", type=str, default="")
-    parser.add_argument("--feature-extractor", type=str, default="mae_minmax",
+    parser.add_argument("--feature-extractor", type=str, default="openphenom",
                         choices=list_extractors() + ["all"])
     parser.add_argument("--samples-per-class", type=int, default=50)
+    parser.add_argument("--real-samples-per-class", type=int, default=4500,
+                        help="Max real samples per class used for reference FID/PR stats")
     parser.add_argument("--cfg-scale", type=float, default=1.0)
     parser.add_argument("--use-frozen-embed", action="store_true", default=False)
     parser.add_argument("--cond-dim", type=int, default=384)
-    parser.add_argument("--embed-dim", type=int, default=384)
     parser.add_argument("--out-dir", type=str, default=None)
     parser.add_argument("--max-perturbations", type=int, default=None,
                         help="Subset to this many perturbations (must match training)")

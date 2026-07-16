@@ -36,25 +36,31 @@ def read_args():
                         help="Use direct class mean embeddings as conditioning (no KL loss, no MLPs)")
     parser.add_argument("--use-frozen-embed", action="store_true", default=False,
                         help="Use FrozenEmbeddingModule (precomputed embeddings + projection, no KL)")
-    parser.add_argument("--embed-dim", type=int, default=384,
-                        help="Dimension of encoder embeddings for guidance module")
     parser.add_argument("--beta", type=float, default=1.0,
                         help="Weight for KL loss term (unused with use_frozen_embed)")
     parser.add_argument("--empirical-bayes-update-freq", type=int, default=10,
                         help="Update mu_eta/sigma_sq_eta every N steps (0 to disable)")
     parser.add_argument("--val-split", type=float, default=0.1,
                         help="Fraction of training data to use as validation set")
-    parser.add_argument("--max-perturbations", type=int, default=None,
-                        help="Number of perturbations to randomly select (from 1451). Default: all.")
-    parser.add_argument("--imbalance-factor", type=float, default=1.0,
-                        help="If < 1.0, drop (1-F) samples from one randomly chosen class.")
+    parser.add_argument("--class-distribution-file", type=str, default=None,
+                        help="Path to a JSON file describing the class-distribution scenario "
+                             "(optional total_perturbations + tiers of imbalance factors). "
+                             "See dataset/ops_dataset.py's OPSDataset docstring for the schema.")
     parser.add_argument("--cond-embedder", type=str, default="openphenom", choices=["openphenom", "genept", "cellprofiler"],
                         help="Embeddings for conditioning module (default: none, or 'genept' for GenePT embeddings)")
     parser.add_argument("--feature-extractor", type=str, default="openphenom",
-                        choices=["openphenom", "mae_arcsinh", "cell_dino", "dinov2", "inception", "all"],
+                        choices=["openphenom", "cell_dino", "dinov2", "inception", "all"],
                         help="Feature extractor for evaluation metrics")
     parser.add_argument("--eval-samples-per-class", type=int, default=500,
                         help="Number of generated samples per class for metrics")
+    parser.add_argument("--use-latent", action="store_true", default=False,
+                        help="Train SiT in VAE latent space instead of pixel space")
+    parser.add_argument("--latent-dir", type=str, default=None,
+                        help="Directory with cached latents + latent_meta.json (see "
+                             "dataset/funk/precompute_latents.py). Required if --use-latent.")
+    parser.add_argument("--vae-checkpoint", type=str, default=None,
+                        help="Path to finetuned VAE checkpoint (see finetune_vae.py). "
+                             "Required for latent-space sampling.")
 
     parse_transport_args(parser)
     args = parser.parse_args()

@@ -2,6 +2,7 @@ import os
 import pickle
 import numpy as np
 import torch
+from scipy import linalg as scipy_linalg
 
 
 def compute_fid(mu1, sigma1, mu2, sigma2):
@@ -125,8 +126,10 @@ def precompute_real_stats(extractor, data_dir, num_classes, embedding_suffix="",
     subset_tag = ""
     if selected_original_indices is not None and len(selected_original_indices) < 1451:
         subset_tag = f"_n{len(selected_original_indices)}"
-    cache_path = os.path.join(cache_dir,
-                              f"real_stats_{extractor.name}{embedding_suffix}{subset_tag}.pkl")
+    cache_path = os.path.join(
+        cache_dir,
+        f"real_stats_{extractor.name}{embedding_suffix}{subset_tag}_spc{samples_per_class}.pkl"
+    )
 
     if os.path.exists(cache_path) and not force:
         with open(cache_path, "rb") as f:
@@ -170,9 +173,3 @@ def compute_class_fid(gen_features, real_mu, real_sigma):
     gen_centered = gen_features - gen_mu
     gen_sigma = (gen_centered.T @ gen_centered) / max(len(gen_features) - 1, 1)
     return compute_fid(gen_mu, gen_sigma, real_mu, real_sigma)
-
-
-try:
-    from scipy import linalg as scipy_linalg
-except ImportError:
-    scipy_linalg = None

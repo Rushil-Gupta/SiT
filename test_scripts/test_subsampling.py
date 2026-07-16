@@ -5,14 +5,28 @@ Usage:
     python test_subsampling.py --data-dir /scratch/rg5218/SiT
 
 Tests:
-1. Default (max_perturbations=None, imbalance_factor=1.0)
+1. Default (max_perturbations=None, no class_distribution_file)
 2. Subset only (max_perturbations=10)
-3. Imbalance only (imbalance_factor=0.3)
-4. Both (max_perturbations=10, imbalance_factor=0.3)
+3. Imbalance only (single-tier class_distribution_file, factor 0.3)
+4. Both (max_perturbations=10, single-tier class_distribution_file, factor 0.3)
 5. Class means slicing matches the selected indices
+
+See test_class_distribution.py for full multi-tier long-tailed coverage.
 """
 import argparse
+import json
+import tempfile
+import os
 import numpy as np
+
+
+def _write_single_tier_config(factor, num_classes=1):
+    """Writes a one-tier class_distribution_file reproducing the old
+    single-class imbalance_factor behavior, for reuse by tests below."""
+    fd, path = tempfile.mkstemp(suffix=".json")
+    with os.fdopen(fd, "w") as f:
+        json.dump({"tiers": {str(factor): num_classes}}, f)
+    return path
 
 
 def test_default(data_dir):
@@ -42,38 +56,46 @@ def test_subset(data_dir):
 
 def test_imbalance(data_dir):
     from dataset import OPSDataset
-    ds = OPSDataset(data_dir, imbalance_factor=0.3, seed=42)
-    assert ds.get_num_perturbations() == 1451
+    config_path = _write_single_tier_config(0.3)
+    try:
+        ds = OPSDataset(data_dir, class_distribution_file=config_path, seed=42)
+        assert ds.get_num_perturbations() == 1451
 
-    # Count samples per class
-    counts = np.bincount(ds.perturbation_indices)
-    min_count = counts.min()
-    max_count = counts.max()
+        # Count samples per class
+        counts = np.bincount(ds.perturbation_indices)
+        min_count = counts.min()
+        max_count = counts.max()
 
-    # With imbalance, min should be noticeably smaller than max
-    # (one class lost ~70% of its samples)
-    print(f"  Per-class counts: min={min_count}, max={max_count}, mean={counts.mean():.1f}")
-    assert min_count < max_count, "Imbalance did not reduce any class"
-    assert max_count / min_count > 2.0, f"Imbalance too mild: {max_count}/{min_count}"
-    print(f"  [PASS] Imbalance(0.3): {len(ds)} images, counts min={min_count} max={max_count}")
+        # With imbalance, min should be noticeably smaller than max
+        # (one class lost ~70% of its samples)
+        print(f"  Per-class counts: min={min_count}, max={max_count}, mean={counts.mean():.1f}")
+        assert min_count < max_count, "Imbalance did not reduce any class"
+        assert max_count / min_count > 2.0, f"Imbalance too mild: {max_count}/{min_count}"
+        print(f"  [PASS] Imbalance(0.3): {len(ds)} images, counts min={min_count} max={max_count}")
 
-    # Reproducibility
-    ds2 = OPSDataset(data_dir, imbalance_factor=0.3, seed=42)
-    np.testing.assert_array_equal(ds.perturbation_indices, ds2.perturbation_indices)
-    print(f"  [PASS] Imbalance reproducibility with seed=42")
+        # Reproducibility
+        ds2 = OPSDataset(data_dir, class_distribution_file=config_path, seed=42)
+        np.testing.assert_array_equal(ds.perturbation_indices, ds2.perturbation_indices)
+        print(f"  [PASS] Imbalance reproducibility with seed=42")
+    finally:
+        os.remove(config_path)
 
 
 def test_both(data_dir):
     from dataset import OPSDataset
-    ds = OPSDataset(data_dir, max_perturbations=20, imbalance_factor=0.3, seed=42)
-    assert ds.get_num_perturbations() == 20
-    unique = set(ds.perturbation_indices)
-    assert unique == set(range(20)), f"Re-indexing wrong after imbalance"
+    config_path = _write_single_tier_config(0.3)
+    try:
+        ds = OPSDataset(data_dir, max_perturbations=20, class_distribution_file=config_path, seed=42)
+        assert ds.get_num_perturbations() == 20
+        unique = set(ds.perturbation_indices)
+        assert unique == set(range(20)), f"Re-indexing wrong after imbalance"
 
-    counts = np.bincount(ds.perturbation_indices, minlength=20)
-    print(f"  Subset(20)+Imbalance(0.3): {len(ds)} images, counts: min={counts.min()} max={counts.max()}")
-    assert counts.min() < counts.max()
-    print(f"  [PASS] Subset + Imbalance")
+        counts = np.bincount(ds.perturbation_indices, minlength=20)
+        print(f"  Subset(20)+Imbalance(0.3): {len(ds)} images, counts: min={counts.min()} max={counts.max()}")
+        assert counts.min() < counts.max()
+        print(f"  [PASS] Subset + Imbalance")
+    finally:
+        os.remove(config_path)
 
 
 def test_class_means_slice(data_dir):

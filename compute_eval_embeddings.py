@@ -31,6 +31,7 @@ from tqdm import tqdm
 import torch.multiprocessing as mp
 
 from metrics.registry import get_extractor, list_extractors
+from metrics.extractors import *
 
 
 def _encode_partition(extractor_name, file_paths, batch_size, device, output_path):

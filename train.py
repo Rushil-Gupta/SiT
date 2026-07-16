@@ -30,7 +30,8 @@ from models import SiT_models, LabelEmbedder
 from download import find_model
 from transport import create_transport, Sampler
 from train_utils import create_logger, setup_logging_and_tracking
-from dataset import OPSDataset
+from dataset import OPSDataset, OPSLatentDataset
+from vae import FunkVAE
 import wandb_utils
 from PIL import Image
 from torchvision.utils import make_grid
@@ -138,12 +139,29 @@ def main(args):
 
     # Setup data:
     data_dir = os.path.join(args.ops_data_dir, args.dataset)
-    dataset = OPSDataset(
-        data_dir,
-        max_perturbations=args.max_perturbations,
-        imbalance_factor=args.imbalance_factor,
-        seed=args.global_seed,
-    )
+    if args.use_latent:
+        assert args.latent_dir is not None, "--latent-dir is required when --use-latent is set"
+        dataset = OPSLatentDataset(
+            data_dir,
+            args.latent_dir,
+            class_distribution_file=args.class_distribution_file,
+            seed=args.global_seed,
+        )
+        in_channels, latent_size, _ = dataset.latent_shape
+    else:
+        dataset = OPSDataset(
+            data_dir,
+            class_distribution_file=args.class_distribution_file,
+            seed=args.global_seed,
+        )
+        in_channels = 4
+
+    if rank == 0:
+        class_distribution_meta = dataset.get_class_distribution_metadata(
+            source_config_file=args.class_distribution_file
+        )
+        with open(os.path.join(args.experiment_dir, "class_distribution.json"), "w") as f:
+            json.dump(class_distribution_meta, f, indent=2)
     num_classes = dataset.get_num_perturbations()
     perturbation_map = dataset.get_perturbation_map() #Mapping from perturbation index to gene name
 
@@ -192,7 +210,8 @@ def main(args):
     logger.info(f"Dataset contains {len(dataset):,} images ({train_size} train, {val_size} val) across {num_classes} perturbations")
 
     # Create model:
-    input_size = args.image_size #4 x 100 x 100 for the image data
+    # Pixel space: 4 x 100 x 100. Latent space (--use-latent): 4 x 13 x 13 (cached VAE latents).
+    input_size = latent_size if args.use_latent else args.image_size
 
     """
     We use one of the pre-defined SiT models
@@ -203,9 +222,8 @@ def main(args):
         use_sample_embed=args.use_sample_embed, #Sample embedding is using the mean embeddings from the frozen model
         use_direct_embed=args.use_direct_embed,
         use_frozen_embed=args.use_frozen_embed,
-        embed_dim=args.embed_dim, #384 in our experiments,
         cond_dim=args.cond_dim,
-        in_channels=4, #4 channels in the image data
+        in_channels=in_channels,
         class_dropout_prob=args.class_dropout
     )
 
@@ -246,6 +264,18 @@ def main(args):
         opt, lr_lambda=lambda step: min(1.0, (step + 1) / warmup_steps)
     )
 
+    # Submodule parameter groups for per-component gradient norm monitoring (diagnostic only):
+    grad_norm_components = {
+        "x_embedder": list(model.module.x_embedder.parameters()),
+        "t_embedder": list(model.module.t_embedder.parameters()),
+        "y_embedder": list(model.module.y_embedder.parameters()),
+        "blocks": list(model.module.blocks.parameters()),
+        "final_layer": list(model.module.final_layer.parameters()),
+        "adaln": [
+            p for block in model.module.blocks for p in block.adaLN_modulation.parameters()
+        ] + list(model.module.final_layer.adaLN_modulation.parameters()),
+    }
+
     # Best checkpoint tracking (defined early so checkpoint resume can reference them)
     best_val_loss = float("inf")
     best_step = 0
@@ -257,7 +287,7 @@ def main(args):
     running_loss = 0
     running_recon_loss = 0
     running_total_grad_norm = 0
-    running_y_embedder_grad_norm = 0
+    running_component_grad_norms = {name: 0 for name in grad_norm_components}
 
     if args.ckpt is not None:
         match = re.search(r'(\d+)\.pt$', args.ckpt)
@@ -293,6 +323,15 @@ def main(args):
     transport_sampler = Sampler(transport)
     logger.info(f"SiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
+    # In latent mode, load the finetuned VAE decoder (frozen) purely for decoding
+    # periodic training-time visualization samples back to pixel space.
+    vis_vae = None
+    if args.use_latent:
+        assert args.vae_checkpoint is not None, "--vae-checkpoint is required when --use-latent is set"
+        vis_vae = FunkVAE(checkpoint_path=args.vae_checkpoint, device=device)
+        vis_vae.eval()
+        requires_grad(vis_vae, False)
+
     # Prepare models for training:
     update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
     model.train()  # important! This enables embedding dropout for classifier-free guidance
@@ -305,7 +344,7 @@ def main(args):
     use_cfg = args.cfg_scale > 1.0
     # Create sampling noise:
     n = ys.size(0)
-    zs = torch.randn(n, 4, input_size, input_size, device=device)
+    zs = torch.randn(n, in_channels, input_size, input_size, device=device)
 
     # Setup classifier-free guidance:
     null_idx = model.module.null_idx
@@ -330,14 +369,15 @@ def main(args):
             
             model_kwargs = dict(y=y)
             
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
-                loss_dict = transport.training_losses(model, x, model_kwargs)
-                loss = loss_dict["loss"].mean() #Mean along the batch dimension
+            loss_dict = transport.training_losses(model, x, model_kwargs)
+            loss = loss_dict["loss"].mean() #Mean along the batch dimension
 
             opt.zero_grad()
             loss.backward()
+            component_grad_norms = {
+                name: grad_norm(params) for name, params in grad_norm_components.items()
+            }
             total_grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            y_embedder_grad_norm = grad_norm(model.module.y_embedder.parameters())
             opt.step()
             scheduler.step()
             update_ema(ema, model.module)
@@ -346,7 +386,8 @@ def main(args):
             running_loss += loss.item()
             running_recon_loss += loss_dict["loss"].mean().item()
             running_total_grad_norm += total_grad_norm.item()
-            running_y_embedder_grad_norm += y_embedder_grad_norm.item()
+            for name, norm in component_grad_norms.items():
+                running_component_grad_norms[name] += norm.item()
             log_steps += 1
             train_steps += 1
 
@@ -359,19 +400,29 @@ def main(args):
                 avg_loss = torch.tensor(running_loss / log_steps, device=device)
                 avg_recon_loss = torch.tensor(running_recon_loss / log_steps, device=device)
                 avg_total_grad_norm = torch.tensor(running_total_grad_norm / log_steps, device=device)
-                avg_y_embedder_grad_norm = torch.tensor(running_y_embedder_grad_norm / log_steps, device=device)
+                avg_component_grad_norms = {
+                    name: torch.tensor(total / log_steps, device=device)
+                    for name, total in running_component_grad_norms.items()
+                }
                 dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(avg_recon_loss, op=dist.ReduceOp.SUM)
                 dist.all_reduce(avg_total_grad_norm, op=dist.ReduceOp.SUM)
-                dist.all_reduce(avg_y_embedder_grad_norm, op=dist.ReduceOp.SUM)
+                for norm in avg_component_grad_norms.values():
+                    dist.all_reduce(norm, op=dist.ReduceOp.SUM)
                 avg_loss = avg_loss.item() / dist.get_world_size()
                 avg_recon_loss = avg_recon_loss.item() / dist.get_world_size()
                 avg_total_grad_norm = avg_total_grad_norm.item() / dist.get_world_size()
-                avg_y_embedder_grad_norm = avg_y_embedder_grad_norm.item() / dist.get_world_size()
+                avg_component_grad_norms = {
+                    name: norm.item() / dist.get_world_size()
+                    for name, norm in avg_component_grad_norms.items()
+                }
+                component_norm_str = ", ".join(
+                    f"{name}: {norm:.4f}" for name, norm in avg_component_grad_norms.items()
+                )
                 logger.info(
                     f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Recon: {avg_recon_loss:.4f}, "
                     f"Train Steps/Sec: {steps_per_sec:.2f}, Grad Norm: {avg_total_grad_norm:.4f}, "
-                    f"Y-Embedder Grad Norm: {avg_y_embedder_grad_norm:.4f}"
+                    f"{component_norm_str}"
                 )
                 if args.wandb:
                     wandb_utils.log(
@@ -380,7 +431,7 @@ def main(args):
                             "recon loss": avg_recon_loss,
                             "train steps/sec": steps_per_sec,
                             "grad norm": avg_total_grad_norm,
-                            "y_embedder grad norm": avg_y_embedder_grad_norm,
+                            **{f"{name} grad norm": norm for name, norm in avg_component_grad_norms.items()},
                         },
                         step=train_steps
                     )
@@ -388,7 +439,7 @@ def main(args):
                 running_loss = 0
                 running_recon_loss = 0
                 running_total_grad_norm = 0
-                running_y_embedder_grad_norm = 0
+                running_component_grad_norms = {name: 0 for name in grad_norm_components}
                 log_steps = 0
                 start_time = time()
 
@@ -442,8 +493,12 @@ def main(args):
 
                     if use_cfg: #remove null samples
                         samples, _ = samples.chunk(2, dim=0)
-                    out_samples = torch.zeros((args.global_batch_size, 4, args.image_size, args.image_size), device=device)
+                    out_samples = torch.zeros((args.global_batch_size, in_channels, input_size, input_size), device=device)
                     dist.all_gather_into_tensor(out_samples, samples)
+
+                    if args.use_latent:
+                        # Decode latents back to pixel space for visualization.
+                        out_samples = vis_vae.decode(out_samples / dataset.scale_factor, crop_size=args.image_size)
 
                 visuals_dir = os.path.join(args.experiment_dir, "visuals") if rank == 0 else None
                 wandb_utils.log_image(out_samples, train_steps, visuals_dir)
@@ -452,11 +507,10 @@ def main(args):
     model.eval()  # important! This disables randomized embedding dropout
 
     # End-of-training evaluation
-    if rank == 0 and False:
+    if rank == 0:
         logger.info("Training complete. Running final evaluation...")
-        extractors = ["mae_minmax", "cell_dino", "dinov2", "inception"] \
+        extractors = ["openphenom", "cell_dino", "dinov2", "inception"] \
             if args.feature_extractor == "all" else [args.feature_extractor]
-        imbalanced_class_idx = getattr(dataset, 'imbalanced_class_idx', None)
         try:
             results = evaluate_model(
                 ema=ema,
@@ -471,8 +525,10 @@ def main(args):
                 samples_per_class=args.eval_samples_per_class,
                 cfg_scale=args.cfg_scale,
                 embedding_suffix=args.embedding_suffix,
-                imbalanced_class_idx=imbalanced_class_idx,
                 image_size=input_size,
+                vae=vis_vae if args.use_latent else None,
+                scale_factor=dataset.scale_factor if args.use_latent else None,
+                pixel_image_size=args.image_size if args.use_latent else None,
             )
             logger.info(f"Evaluation results: {json.dumps(results, indent=2)}")
             if args.wandb:

@@ -1,5 +1,7 @@
 import os
 import json
+from collections import defaultdict
+
 import torch
 import numpy as np
 
@@ -7,6 +9,7 @@ from .registry import get_extractor
 from .fid import precompute_real_stats, compute_fid, compute_class_fid
 from .generation import generate_balanced_samples, generate_class_samples, save_samples
 from .precision_recall import compute_precision_recall
+from .mmd_kid import compute_mmd, compute_kid
 
 
 def _intra_class_diversity(features):
@@ -39,12 +42,34 @@ def evaluate_model(
     samples_per_class=50,
     cfg_scale=1.0,
     embedding_suffix="",
-    imbalanced_class_idx=None,
-    majority_class_idx=None,
     image_size=100,
     ode_method="dopri5",
     ode_steps=50,
+    vae=None,
+    scale_factor=None,
+    pixel_image_size=None,
 ):
+    """
+    image_size: spatial size of the noise tensor fed to the model — the
+        latent size (e.g. 16) when `vae` is given (--use-latent models),
+        otherwise the pixel image size.
+    vae, scale_factor, pixel_image_size: pass a loaded FunkVAE (+ the
+        dataset's scale_factor + the target pixel resolution, e.g. 100) for
+        latent-space models, so generated samples are decoded back to real
+        pixel-space images before being saved/passed to any extractor.
+        Leave as None for pixel-space models.
+
+    Per-class metrics are grouped by `dataset.class_imbalance_factors` (see
+    OPSDataset) into tiers -- e.g. factor 1.0 (no imbalance), 0.1, 0.05, 0.01
+    -- rather than hardcoding a single "imbalanced" and "majority" class.
+    Each tier's FID/CMD/diversity is the mean (and std, across that tier's
+    classes) of the same per-class computation, reusing
+    `real_stats["per_class"]` (already computed for every class) and
+    `compute_class_fid` (already class-agnostic) -- no new FID math needed.
+    """
+    if vae is not None:
+        assert scale_factor is not None and pixel_image_size is not None, \
+            "scale_factor and pixel_image_size are required when vae is provided"
     if feature_extractors is None:
         feature_extractors = ["openphenom"]
     if isinstance(feature_extractors, str):
@@ -52,14 +77,18 @@ def evaluate_model(
 
     model_fn = ema.forward_with_cfg if cfg_scale > 1.0 else ema.forward
 
-    if majority_class_idx is None and imbalanced_class_idx is not None:
-        majority_class_idx = (imbalanced_class_idx + 1) % num_classes
+    class_factors = getattr(dataset, "class_imbalance_factors", None)
+    tiers = defaultdict(list)
+    if class_factors is not None:
+        for class_idx, factor in enumerate(class_factors):
+            tiers[round(float(factor), 6)].append(class_idx)
 
     print(f"Generating {samples_per_class} samples per class for {num_classes} classes...")
     gen_images, gen_labels = generate_balanced_samples(
         model_fn, transport_sampler, num_classes, null_idx,
         samples_per_class, cfg_scale, device, image_size,
         ode_method, ode_steps,
+        vae=vae, scale_factor=scale_factor, pixel_image_size=pixel_image_size,
     )
 
     sample_dir = os.path.join(experiment_dir, "eval_samples")
@@ -100,31 +129,38 @@ def evaluate_model(
         )
         results[f"{ext_name}/fid/balanced"] = balanced_fid
 
-        if imbalanced_class_idx is not None and real_stats["per_class"] is not None:
-            imb_mu, imb_sigma, _ = real_stats["per_class"][imbalanced_class_idx]
-            class_mask = gen_labels == imbalanced_class_idx
-            if class_mask.any():
-                class_feats = gen_features_all[class_mask]
-                imb_fid = compute_class_fid(class_feats, imb_mu, imb_sigma)
-                results[f"{ext_name}/fid/imbalanced"] = imb_fid
-                results[f"{ext_name}/cmd/imbalanced"] = _class_mean_distance(class_feats, imb_mu)
-                results[f"{ext_name}/diversity/imbalanced"] = _intra_class_diversity(class_feats)
+        if real_stats["per_class"] is not None:
+            for factor in sorted(tiers.keys(), reverse=True):
+                tier_fids, tier_cmds, tier_diversities = [], [], []
+                for class_idx in tiers[factor]:
+                    class_mu, class_sigma, _ = real_stats["per_class"][class_idx]
+                    class_mask = gen_labels == class_idx
+                    if not class_mask.any():
+                        continue
+                    class_feats = gen_features_all[class_mask]
+                    tier_fids.append(compute_class_fid(class_feats, class_mu, class_sigma))
+                    tier_cmds.append(_class_mean_distance(class_feats, class_mu))
+                    tier_diversities.append(_intra_class_diversity(class_feats))
 
-        if majority_class_idx is not None and real_stats["per_class"] is not None:
-            maj_mu, maj_sigma, _ = real_stats["per_class"][majority_class_idx]
-            class_mask = gen_labels == majority_class_idx
-            if class_mask.any():
-                class_feats = gen_features_all[class_mask]
-                maj_fid = compute_class_fid(class_feats, maj_mu, maj_sigma)
-                results[f"{ext_name}/fid/majority"] = maj_fid
-                results[f"{ext_name}/cmd/majority"] = _class_mean_distance(class_feats, maj_mu)
-                results[f"{ext_name}/diversity/majority"] = _intra_class_diversity(class_feats)
+                if not tier_fids:
+                    continue
+                tier_name = f"{factor:g}"
+                results[f"{ext_name}/fid/tier_{tier_name}"] = float(np.mean(tier_fids))
+                results[f"{ext_name}/fid/tier_{tier_name}_std"] = float(np.std(tier_fids))
+                results[f"{ext_name}/cmd/tier_{tier_name}"] = float(np.mean(tier_cmds))
+                results[f"{ext_name}/diversity/tier_{tier_name}"] = float(np.mean(tier_diversities))
+                results[f"{ext_name}/tier_{tier_name}_num_classes"] = len(tier_fids)
 
         real_feats = real_stats.get("global_feats")
         if real_feats is not None:
             precision, recall = compute_precision_recall(real_feats, feats_np)
             results[f"{ext_name}/precision"] = precision
             results[f"{ext_name}/recall"] = recall
+
+            results[f"{ext_name}/mmd"] = compute_mmd(real_feats, feats_np)
+            kid_mean, kid_std = compute_kid(real_feats, feats_np)
+            results[f"{ext_name}/kid_mean"] = kid_mean
+            results[f"{ext_name}/kid_std"] = kid_std
 
         print(f"  {ext_name}/fid/balanced = {balanced_fid:.4f}")
 

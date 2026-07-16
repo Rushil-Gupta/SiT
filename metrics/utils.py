@@ -6,8 +6,17 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
 
 
 class ConvtoRGB(torch.nn.Module):
+    """Fixed 4-channel -> RGB pseudo-coloring (RxRx1/CellPainting-style channel
+    blend), not a learned/general conversion. in_channels must be 4."""
     def __init__(self, in_channels=4, out_channels=3):
         super().__init__()
+        if in_channels != 4:
+            raise ValueError(
+                f"ConvtoRGB only supports in_channels=4 (fixed channel-weight "
+                f"blend), got {in_channels}."
+            )
+        if out_channels != 3:
+            raise ValueError(f"ConvtoRGB only supports out_channels=3, got {out_channels}.")
         self.in_channels = in_channels
         self.out_channels = out_channels
 

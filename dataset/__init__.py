@@ -1,3 +1,3 @@
-from .ops_dataset import OPSDataset
+from .ops_dataset import OPSDataset, OPSLatentDataset, GlobalMinMaxNorm
 
-__all__ = ['OPSDataset']
+__all__ = ['OPSDataset', 'OPSLatentDataset', 'GlobalMinMaxNorm']

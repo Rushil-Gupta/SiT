@@ -68,21 +68,21 @@ class SampleEmbeddingModule(nn.Module):
     Handles label dropout for classifier-free guidance by mapping dropped labels
     to the NTC (null) class index.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob=0.1, embed_dim=384):
+    def __init__(self, num_classes, hidden_size, dropout_prob=0.1, cond_dim=384):
         super().__init__()
         self.num_classes = num_classes
         self.dropout_prob = dropout_prob
-        self.embed_dim = embed_dim
+        self.cond_dim = cond_dim
 
-        self.register_buffer('class_means', torch.zeros(num_classes + 1, embed_dim))
+        self.register_buffer('class_means', torch.zeros(num_classes + 1, cond_dim))
 
         self.mu_phi = nn.Sequential(
-            nn.Linear(embed_dim, hidden_size, bias=True),
+            nn.Linear(cond_dim, hidden_size, bias=True),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
         )
         self.sigma_phi = nn.Sequential(
-            nn.Linear(embed_dim, hidden_size, bias=True),
+            nn.Linear(cond_dim, hidden_size, bias=True),
             nn.ReLU(),
             nn.Linear(hidden_size, hidden_size, bias=True),
             nn.ReLU(),  # Ensure sigma is positive
@@ -161,13 +161,13 @@ class DirectEmbeddingModule(nn.Module):
     Label dropout still works: dropped labels map to NTC index, which returns
     the NTC embedding.
     """
-    def __init__(self, num_classes, hidden_size, dropout_prob=0.1, embed_dim=384):
+    def __init__(self, num_classes, hidden_size, dropout_prob=0.1, cond_dim=384):
         super().__init__()
         self.num_classes = num_classes
         self.dropout_prob = dropout_prob
-        self.embed_dim = embed_dim
+        self.cond_dim = cond_dim
 
-        self.register_buffer('class_means', torch.zeros(num_classes + 1, embed_dim))
+        self.register_buffer('class_means', torch.zeros(num_classes + 1, cond_dim))
 
     def token_drop(self, labels, force_drop_ids=None):
         if force_drop_ids is None:
@@ -312,7 +312,6 @@ class SiT(nn.Module):
         learn_sigma=False,
         use_sample_embed=False,
         use_direct_embed=False,
-        embed_dim=384,
         use_frozen_embed=False,
         cond_dim=384,
     ):
@@ -334,9 +333,9 @@ class SiT(nn.Module):
         if use_frozen_embed:
             self.y_embedder = FrozenEmbeddingModule(num_classes, hidden_size, cond_dim, dropout_prob=class_dropout_prob)
         elif use_direct_embed: #Use direct class means
-            self.y_embedder = DirectEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
+            self.y_embedder = DirectEmbeddingModule(num_classes, hidden_size, class_dropout_prob, cond_dim)
         elif use_sample_embed: #Use learned guidance module with reparameterization and KL loss
-            self.y_embedder = SampleEmbeddingModule(num_classes, hidden_size, class_dropout_prob, embed_dim)
+            self.y_embedder = SampleEmbeddingModule(num_classes, hidden_size, class_dropout_prob, cond_dim)
         else: #Use learnable embedding table for class labels
             self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches

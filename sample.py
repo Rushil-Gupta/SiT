@@ -13,7 +13,9 @@ from download import find_model
 from models import SiT_models
 from train_utils import parse_ode_args, parse_sde_args, parse_transport_args
 from transport import create_transport, Sampler
+from vae import FunkVAE
 import argparse
+import json
 import sys
 from time import time
 
@@ -40,7 +42,18 @@ def main(mode, args):
         use_frozen_embed = args.use_frozen_embed
 
     # Load model:
-    input_size = args.image_size
+    latent_scale_factor = None
+    if args.use_latent:
+        assert args.latent_dir is not None, "--latent-dir is required when --use-latent is set"
+        assert args.vae_checkpoint is not None, "--vae-checkpoint is required when --use-latent is set"
+        with open(f"{args.latent_dir}/latent_meta.json", "r") as f:
+            latent_meta = json.load(f)
+        latent_scale_factor = latent_meta["scale_factor"]
+        in_channels, input_size, _ = latent_meta["latent_shape"]
+    else:
+        in_channels = 4
+        input_size = args.image_size
+
     model = SiT_models[args.model](
         input_size=input_size,
         num_classes=args.num_classes,
@@ -48,8 +61,8 @@ def main(mode, args):
         use_guidance=use_guidance,
         use_direct_embed=use_direct_embed,
         use_frozen_embed=use_frozen_embed,
-        embed_dim=args.embed_dim,
         cond_dim=args.cond_dim,
+        in_channels=in_channels,
     ).to(device)
 
     if torch.cuda.is_available():
@@ -116,7 +129,7 @@ def main(mode, args):
 
     # Create sampling noise:
     n = len(class_labels)
-    z = torch.randn(n, 4, input_size, input_size, device=device)
+    z = torch.randn(n, in_channels, input_size, input_size, device=device)
     y = torch.tensor(class_labels, device=device)
 
     # Setup classifier-free guidance:
@@ -132,6 +145,12 @@ def main(mode, args):
     samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
     print(f"Sampling took {time() - start_time:.2f} seconds.")
+
+    if args.use_latent:
+        vae = FunkVAE(checkpoint_path=args.vae_checkpoint, device=device)
+        vae.eval()
+        with torch.no_grad():
+            samples = vae.decode(samples / latent_scale_factor, crop_size=args.image_size)
 
     # Save and display images:
     save_image(samples, "sample.png", nrow=4, normalize=True, value_range=(-1, 1))
@@ -150,7 +169,9 @@ if __name__ == "__main__":
     assert mode in ["ODE", "SDE"], "Invalid mode. Please choose 'ODE' or 'SDE'"
     
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, default=256,
+                         help="256 or 512 for auto-downloaded ImageNet checkpoints; "
+                              "100 (or the OPS dataset's native size) for custom OPS checkpoints.")
     parser.add_argument("--num-classes", type=int, default=1451)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
@@ -164,11 +185,16 @@ if __name__ == "__main__":
     parser.add_argument("--use-frozen-embed", action="store_true", default=False,
                         help="Use FrozenEmbeddingModule (precomputed embeddings + projection, no KL)")
     parser.add_argument("--cond-dim", type=int, default=384,
-                        help="Dimension of frozen precomputed embeddings")
-    parser.add_argument("--embed-dim", type=int, default=384,
-                        help="Dimension of encoder embeddings for guidance module")
+                        help="Dimension of precomputed conditioning embeddings")
     parser.add_argument("--embedding-suffix", type=str, default="",
                         help="Suffix for ops_class_means filename (e.g. _minmax)")
+    parser.add_argument("--use-latent", action="store_true", default=False,
+                        help="Sample a SiT checkpoint trained in VAE latent space (--use-latent in train.py)")
+    parser.add_argument("--latent-dir", type=str, default=None,
+                        help="Directory with latent_meta.json (see dataset/funk/precompute_latents.py). "
+                             "Required if --use-latent.")
+    parser.add_argument("--vae-checkpoint", type=str, default=None,
+                        help="Path to finetuned VAE checkpoint (see finetune_vae.py). Required if --use-latent.")
 
 
     parse_transport_args(parser)
